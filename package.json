@@ -1,0 +1,17 @@
+{
+  "name": "bytecode-scan",
+  "version": "0.1.0",
+  "description": "Static EVM bytecode triage: selectors, annotated listings and red flags",
+  "license": "MIT",
+  "bin": { "bytecode": "dist/cli.js" },
+  "main": "dist/scan.js",
+  "files": ["dist", "data"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "dependencies": { "@noble/hashes": "1.8.0" },
+  "devDependencies": { "@types/node": "20.17.6", "typescript": "5.6.3" }
+}

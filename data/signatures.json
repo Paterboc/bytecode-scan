@@ -1,0 +1,1 @@
+{"_note": "Optional known-bad signatures. Empty by default; load your own with --signatures <file> or env BYTECODE_SIGNATURES.", "codeHashes": {}, "addresses": {}}
