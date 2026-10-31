@@ -156,7 +156,7 @@ function wordString(hex: string): string | null {
  * a flood of fall-through selector compares makes every walk traverse the same long chain. Real tokens use a tiny fraction (corpus: <= 81 selectors).
  * When exceeded the walks stop and scanBytecode emits `analysis_budget_exceeded`; the O(n) linear-floor HIGH checks still run.
  */
-const MAX_WORK_OPS = 400_000, MAX_SELECTORS = 1000;
+const MAX_WORK_OPS = 400_000, MAX_SELECTORS = 1000, MAX_WALK_OPS = 16_000;
 const MAX_BYTES = 4_000_000, MAX_STR = 1024, MAX_COPY = 256, MAX_QUEUE = 512; // listing/string bytes per scan, chars per revert string, bytes read per CODECOPY, pending blocks per walk
 const budget = { left: MAX_WORK_OPS, bytes: MAX_BYTES, exceeded: false };
 const spend = (): boolean => { if (budget.left-- <= 0) budget.exceeded = true; return !budget.exceeded; };
@@ -282,7 +282,7 @@ function skeletonHash(stripped: Buffer): string {
 const jumpDest = (hex: string): number => { const t = hex.replace(/^0+/, ''); return t.length > 12 ? -1 : parseInt(t || '0', 16); };
 
 type V = bigint | 'E' | 'C'; // constant | carried in from an earlier block | computed in this block
-interface El { v: V; src?: bigint[]; caller?: boolean; ld?: boolean; deb?: boolean } // src = constant storage slots the value was SLOADed from; caller = derived from CALLER
+interface El { v: V; src?: bigint[]; map?: bigint; caller?: boolean; cd?: boolean; ld?: boolean; deb?: boolean } // cd = derived from calldata; src = constant storage slots the value was SLOADed from; caller = derived from CALLER
 interface Flow {
   jumps: Map<number, V>;              // operand of each JUMP/JUMPI
   rets: Map<number, number[]>;        // JUMP pc -> dest-sized constants pushed earlier in its block chain (callee targets and return labels)
@@ -291,6 +291,9 @@ interface Flow {
   maps: Map<number, bigint>;          // MSTORE(0x20, const) pc: the constant is a mapping slot about to be hashed
   callerCmps: Map<number, bigint>;    // EQ/SUB/XOR pc comparing a CALLER/ORIGIN-derived value with an address-sized constant (after masks)
   debits: Set<number>;                // SSTORE pcs storing a value computed as (SLOADed value - x)
+  otherKeys: Map<number, bigint>;     // KECCAK pc hashing a non-msg.sender key under this mapping root
+  cdMaps: Map<number, bigint>;        // KECCAK pc hashing a calldata-derived key under this mapping root
+  stores: Map<number, bigint>;        // SSTORE pc -> root mapping slot of its key, when the key was hashed in the same block
 }
 const EFFECT = new Map<number, [number, number]>();
 for (const [list, p, q] of [
@@ -308,45 +311,115 @@ const FOLD: Record<number, (a: bigint, b: bigint) => bigint> = {
   0x1b: (a, b) => a >= 256n ? 0n : (b << a) & M256, 0x1c: (a, b) => a >= 256n ? 0n : b >> a,
 };
 /**
- * Per-basic-block constant-propagating stack simulation (stack empty at each JUMPDEST).
- * ponytail: intra-block only; values crossing blocks are 'E' (carried). Upgrade path: a real CFG with dataflow.
+ * Constant- and taint-propagating stack simulation, one basic block at a time (stack empty at a JUMPDEST unless seeded).
+ * Multi-pass: each pass seeds a JUMPDEST's entry stack with CALLER-taint (by stack depth) observed at its static predecessors
+ * (fallthrough, constant JUMP/JUMPI), and at the return labels of internal calls to a helper that returns caller-derived data
+ * (with the pre-call stack, constants included). At most MAX_PASSES passes, each O(n).
+ * ponytail: only the caller bit crosses blocks (plus the pre-call stack at return labels); constants and storage/mapping tags do not.
  */
+const MAX_PASSES = 6, SEED_DEPTH = 16;
+type Seeds = Map<number, Map<number, number>>; // JUMPDEST pc -> stack depth -> taint bits (1 = caller, 2 = calldata)
 function simulate(ops: Op[]): Flow {
-  const jumps = new Map<number, V>(), rets = new Map<number, number[]>(), keys = new Map<number, bigint>(), guards = new Map<number, bigint[]>(), maps = new Map<number, bigint>(), debits = new Set<number>(), callerCmps = new Map<number, bigint>();
+  const seeds: Seeds = new Map(), frames = new Map<number, El[] | null>();
+  let res!: Flow;
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const out: Seeds = new Map();
+    res = simulateOnce(ops, seeds, frames, out);
+    let changed = false;
+    for (const [pc, ds] of out) { const cur = seeds.get(pc) ?? new Map<number, number>(); for (const [d, bits] of ds) if (((cur.get(d) ?? 0) | bits) !== (cur.get(d) ?? 0)) { cur.set(d, (cur.get(d) ?? 0) | bits); changed = true; } seeds.set(pc, cur); }
+    if (!changed) break;
+  }
+  return res;
+}
+const bit160 = 1n << 160n, MASK160 = bit160 - 1n;
+/** Address-sized constant: 12..20 significant bytes, not the 160-bit all-ones mask. */
+const addrSized = (v: bigint): boolean => v >= 1n << 92n && v < bit160 && v !== MASK160;
+function simulateOnce(ops: Op[], seeds: Seeds, frames: Map<number, El[] | null>, out: Seeds): Flow {
+  const jumps = new Map<number, V>(), rets = new Map<number, number[]>(), keys = new Map<number, bigint>(), guards = new Map<number, bigint[]>(), maps = new Map<number, bigint>(), debits = new Set<number>(), callerCmps = new Map<number, bigint>(), stores = new Map<number, bigint>(), cdMaps = new Map<number, bigint>(), otherKeys = new Map<number, bigint>();
   const st: El[] = []; let pending: number[] = []; const small = (ops[ops.length - 1]?.pc ?? 0) < 256;
+  const mem = new Map<bigint, El>(); // constant-offset memory words written in this block (for mapping-slot tagging)
   const pop = (): El => st.pop() ?? { v: 'E' };
+  const addSeed = (pc: number, stack: El[]): void => {
+    for (let d = 0; d < Math.min(stack.length, SEED_DEPTH); d++) { const e = stack[stack.length - 1 - d], bits = (e.caller ? 1 : 0) | (e.cd ? 2 : 0); if (bits) { const s = out.get(pc) ?? new Map<number, number>(); s.set(d, (s.get(d) ?? 0) | bits); out.set(pc, s); } }
+  };
+  const succ = new Map<number, number[]>(), exitBits = new Map<number, Map<number, number>>(); // block -> static successors; block ending in a return jump -> taint by depth
+  const link = (from: number, to: number): void => { const l = succ.get(from); if (l) l.push(to); else succ.set(from, [to]); };
+  const calls: [number, number[], El[]][] = []; let cur = 0, fell = true;
   for (const o of ops) {
     const b = o.op;
-    if (b === 0x5b) { st.length = 0; continue; } // fallthrough keeps `pending`
+    if (b === 0x5b) { // JUMPDEST: seed from fallthrough, then from earlier passes
+      if (fell) { addSeed(o.pc, st); link(cur, o.pc); }
+      st.length = 0; mem.clear(); cur = o.pc; fell = true;
+      const fr = frames.get(o.pc), sd = seeds.get(o.pc);
+      if (fr) for (const e of fr) st.push({ ...e });
+      else if (sd) { const n = Math.max(...sd.keys()) + 1; for (let k = 0; k < n; k++) st.push({ v: 'E' }); for (const [d, bits] of sd) st[st.length - 1 - d] = { v: 'E', caller: !!(bits & 1), cd: !!(bits & 2) }; }
+      continue;
+    } // fallthrough keeps `pending`
     if (b >= 0x60 && b <= 0x7f) { st.push({ v: BigInt('0x' + (o.data || '0')) }); const d = jumpDest(o.data || '0'); if (d >= 0 && (b === 0x61 || b === 0x62 || (b === 0x60 && small))) pending.push(d); continue; } // code labels are PUSH2/3 in contracts over 255 bytes
     if (b === 0x5f) { st.push({ v: 0n }); continue; }
     if (b >= 0x80 && b <= 0x8f) { st.push(st[st.length - (b - 0x7f)] ?? { v: 'E' }); continue; }
     if (b >= 0x90 && b <= 0x9f) { const n = b - 0x8f; while (st.length <= n) st.unshift({ v: 'E' }); const t = st.length - 1; [st[t], st[t - n]] = [st[t - n], st[t]]; continue; }
     if (b === 0x56 || b === 0x57) {
-      jumps.set(o.pc, pop().v);
-      if (b === 0x57) pop(); else { rets.set(o.pc, pending); pending = []; st.length = 0; }
+      const tv = pop().v; jumps.set(o.pc, tv);
+      if (b === 0x57) pop();
+      if (typeof tv === 'bigint' && tv < 1n << 40n) { addSeed(Number(tv), st); link(cur, Number(tv)); }
+      if (b === 0x56) {
+        if (tv === 'E') { const m = new Map<number, number>(); for (let d = 0; d < Math.min(st.length, SEED_DEPTH); d++) { const e = st[st.length - 1 - d], bits = (e.caller ? 1 : 0) | (e.cd ? 2 : 0); if (bits) m.set(d, bits); } if (m.size) exitBits.set(cur, m); } // return jump: taint of the returned values
+        if (typeof tv === 'bigint') calls.push([Number(tv), [...pending], st.slice(-SEED_DEPTH)]);
+        rets.set(o.pc, pending); pending = []; st.length = 0; fell = false;
+      }
       continue;
     }
     if (b === 0x55 && st[st.length - 2]?.deb) debits.add(o.pc);
     if (b === 0x54 || b === 0x55) { const k = st[st.length - 1]?.v; if (typeof k === 'bigint') keys.set(o.pc, k); }
-    if (b === 0x52 && st[st.length - 1]?.v === 0x20n && typeof st[st.length - 2]?.v === 'bigint') maps.set(o.pc, st[st.length - 2].v as bigint);
+    if (b === 0x55 && st[st.length - 1]?.map !== undefined) stores.set(o.pc, st[st.length - 1].map!);
+    if (b === 0x52) {
+      const off = st[st.length - 1]?.v, val = st[st.length - 2];
+      if (typeof off === 'bigint' && val) mem.set(off, val);
+      if (off === 0x20n && typeof val?.v === 'bigint') maps.set(o.pc, val.v);
+    }
     if (b >= 0xa0 && b <= 0xa4) { for (let k = 0; k < 2 + b - 0xa0; k++) pop(); continue; }
     const [p, q] = EFFECT.get(b) ?? [0, 0];
     const args = Array.from({ length: p }, pop);
     const src = [...new Set(args.flatMap(a => a.src ?? []))].slice(0, 8); // dedupe+cap: DUP1 ADD chains would double it per op (OOM on a 60-byte input)
+    let map: bigint | undefined;
+    if (b === 0x20 && typeof args[0].v === 'bigint' && args[1].v === 0x40n) { // keccak(off, 0x40): the word at off+0x20 is the mapping slot (or an inner hash carrying its root)
+      const w = mem.get(args[0].v + 0x20n); if (w) map = typeof w.v === 'bigint' ? w.v : w.map;
+      if (map !== undefined) { maps.set(o.pc, map); const key = mem.get(args[0].v); if (key?.cd) cdMaps.set(o.pc, map); if (!key?.caller) otherKeys.set(o.pc, map); } // otherKeys: hashed under a key that is not msg.sender
+    }
     if ((b === 0x14 || b === 0x03 || b === 0x18) && args.length === 2) for (const [x, y] of [[args[0], args[1]], [args[1], args[0]]]) if (x.caller && y.src?.length) guards.set(o.pc, y.src);
-    if ((b === 0x14 || b === 0x03 || b === 0x18) && args.length === 2) for (const [x, y] of [[args[0], args[1]], [args[1], args[0]]]) {
-      if (x.caller && typeof y.v === 'bigint' && y.v >= 1n << 95n && y.v < 1n << 160n && y.v !== (1n << 160n) - 1n) callerCmps.set(o.pc, y.v); // solc codegen: CALLER EQ/SUB/XOR const, with or without ISZERO, mask folded
+    if ((b === 0x14 || b === 0x03 || b === 0x18 || b === 0x01 || (b >= 0x10 && b <= 0x13)) && args.length === 2) for (const [x, y] of [[args[0], args[1]], [args[1], args[0]]]) {
+      if (!x.caller || typeof y.v !== 'bigint') continue;
+      // solc codegen: CALLER EQ/SUB/XOR const (with or without ISZERO, masks folded); optimizer's `ADD (2^256 - X)`; range compares LT/GT/SLT/SGT; bytes20 compares (const << 96)
+      const c = b === 0x01 ? (1n << 256n) - y.v : y.v;
+      if (addrSized(c)) callerCmps.set(o.pc, c);
+      else if ((c & ((1n << 96n) - 1n)) === 0n && addrSized(c >> 96n)) callerCmps.set(o.pc, c >> 96n);
     }
     const f = b in FOLD ? FOLD[b] : undefined;
     for (let k = 0; k < q; k++) {
-      const v: V = f && typeof args[0].v === 'bigint' && typeof args[1].v === 'bigint' ? f(args[0].v, args[1].v) : 'C';
+      const v: V = f && typeof args[0].v === 'bigint' && typeof args[1].v === 'bigint' ? f(args[0].v, args[1].v) : b === 0x19 && typeof args[0].v === 'bigint' ? ~args[0].v & M256 : 'C';
       const slot = b === 0x54 ? keys.get(o.pc) : undefined;
-      st.push({ v, src: slot !== undefined ? [slot] : src, caller: b === 0x33 || b === 0x32 || (!NO_TAINT.has(b) && args.some(a => a.caller)), ld: b === 0x54 || args.some(a => a.ld), deb: (b === 0x03 && args.some(a => a.ld)) || args.some(a => a.deb) });
+      st.push({ v, src: slot !== undefined ? [slot] : src, map, cd: b === 0x35 || (!NO_TAINT.has(b) && args.some(a => a.cd)), caller: b === 0x33 || b === 0x32 || (!NO_TAINT.has(b) && args.some(a => a.caller)), ld: b === 0x54 || args.some(a => a.ld), deb: (b === 0x03 && args.some(a => a.ld)) || args.some(a => a.deb) });
     }
-    if (TERMINATORS.has(o.name)) { st.length = 0; pending = []; }
+    if (TERMINATORS.has(o.name)) { st.length = 0; pending = []; fell = false; }
   }
-  return { jumps, rets, keys, guards, maps, debits, callerCmps };
+  // return labels of calls to caller-returning helpers: the label receives the pre-call stack with a tainted top
+  for (const [t, labels, site] of calls) {
+    // taint a helper returns = union over the return jumps reachable from its entry (bounded BFS over static edges)
+    const ret = new Map<number, number>(), seen = new Set<number>([t]), q = [t];
+    while (q.length && seen.size < 64) { const b = q.shift()!; for (const [d, bits] of exitBits.get(b) ?? []) ret.set(d, (ret.get(d) ?? 0) | bits); for (const n of succ.get(b) ?? []) if (!seen.has(n)) { seen.add(n); q.push(n); } }
+    if (!ret.size) continue;
+    for (const r of labels) if (r !== t) {
+    const s2 = out.get(r) ?? new Map<number, number>(); for (const [d, bits] of ret) s2.set(d, (s2.get(d) ?? 0) | bits); out.set(r, s2);
+    const top = site[site.length - 1];
+    if (top && top.v === BigInt(r) && (ret.get(0) ?? 0) & 1) {
+      const full: El[] = [...site.slice(0, -1).map(e => ({ v: e.v, caller: e.caller, cd: e.cd })), { v: 'E', caller: true }];
+      const old = frames.get(r);
+      frames.set(r, old === undefined ? full : old !== null && JSON.stringify(old, (_k, x) => typeof x === 'bigint' ? x.toString() : x) === JSON.stringify(full, (_k, x) => typeof x === 'bigint' ? x.toString() : x) ? old : null);
+    }
+    }
+  }
+  return { jumps, rets, keys, guards, maps, debits, callerCmps, stores, cdMaps, otherKeys };
 }
 const jumpTarget = (flow: Flow, pc: number): number => { const v = flow.jumps.get(pc); return typeof v === 'bigint' && v < 1n << 40n ? Number(v) : -1; };
 /** Static successors of a JUMP/JUMPI: its (folded) constant operand, plus for JUMP every dest-sized constant pushed in its block (callee + return labels). */
@@ -379,12 +452,13 @@ function livePcs(ops: Op[], byPc: Map<number, number>, dests: Set<number>, flow:
 }
 
 type Slots = Set<bigint>;
-interface Facts { names: Set<string>; rd: Slots; wr: Slots; guard: Slots; maps: Slots }
+interface Facts { names: Set<string>; rd: Slots; wr: Slots; guard: Slots; maps: Slots; wmaps: Slots; cdmaps: Slots; okeys: Slots }
 /** Op names, constant storage slots read/written, owner/admin guard slots and hashed mapping slots on the walk from `entry`. */
 function reachFacts(ops: Op[], byPc: Map<number, number>, dests: Set<number>, flow: Flow, entry: number): Facts {
-  // ponytail: slots come from intra-block constant propagation; unresolved keys fall back to a nearby-PUSH1/2 heuristic. Capped at 4000 ops.
-  const names = new Set<string>(), rd: Slots = new Set(), wr: Slots = new Set(), guard: Slots = new Set(), maps: Slots = new Set(), seen = new Set<number>(); const q = [entry]; let n = 0;
-  while (q.length && n < 4000 && !budget.exceeded) {
+  // ponytail: slots come from intra-block constant propagation; unresolved keys fall back to a nearby-PUSH1/2 heuristic. Capped at MAX_WALK_OPS ops per walk (exceeding it raises analysis_budget_exceeded).
+  const names = new Set<string>(), rd: Slots = new Set(), wr: Slots = new Set(), guard: Slots = new Set(), maps: Slots = new Set(), wmaps: Slots = new Set(), cdmaps: Slots = new Set(), okeys: Slots = new Set(), seen = new Set<number>(); const q = [entry]; let n = 0;
+  while (q.length && !budget.exceeded) {
+    if (n >= MAX_WALK_OPS) { budget.exceeded = true; break; } // fail closed: an over-long walk is reported, not silently truncated
     const p = q.pop()!; if (seen.has(p) || !byPc.has(p)) continue;
     seen.add(p);
     for (let i = byPc.get(p)!; i < ops.length; n++) {
@@ -400,13 +474,16 @@ function reachFacts(ops: Op[], byPc: Map<number, number>, dests: Set<number>, fl
       }
       for (const g of flow.guards.get(o.pc) ?? []) guard.add(g);
       const m = flow.maps.get(o.pc); if (m !== undefined) maps.add(m);
+      const w = flow.stores.get(o.pc); if (w !== undefined) wmaps.add(w);
+      const cm = flow.cdMaps.get(o.pc); if (cm !== undefined) cdmaps.add(cm);
+      const ok = flow.otherKeys.get(o.pc); if (ok !== undefined) okeys.add(ok);
       if (flow.debits.has(o.pc)) names.add('DEBIT');
       if (TERMINATORS.has(o.name)) break;
       i++;
       if (ops[i]?.name === 'JUMPDEST') { if (seen.has(ops[i].pc)) break; seen.add(ops[i].pc); }
     }
   }
-  return { names, rd, wr, guard, maps };
+  return { names, rd, wr, guard, maps, wmaps, cdmaps, okeys };
 }
 
 const sel4 = (s: string): string => keccakId(s).slice(0, 10);
@@ -432,16 +509,18 @@ function behaviourFlags(ops: Op[], byPc: Map<number, number>, dests: Set<number>
   const out: Flag[] = []; const fn = (s: Selector): FlagFunction => ({ selector: s.selector, name: s.name });
   const hasOwner = selectors.some(s => s.selector === SEL_OWNER);
   const facts = new Map(selectors.map(s => [s.selector, reachFacts(ops, byPc, dests, flow, s.entry)]));
-  const guarded = (f: Facts): boolean => f.guard.size > 0 && f.names.has('CALLER') && hasCmp(f.names); // CALLER compared with a constant-slot SLOAD
+  const guarded = (f: Facts): boolean => f.guard.size > 0; // the simulation saw CALLER/ORIGIN compared with a constant-slot SLOAD (guard slots are only recorded at such comparisons)
   const cands = selectors.filter(s => !CORE_SELS.has(s.selector));
   const xr: Slots = new Set(); for (const t of [SEL_TRANSFER, SEL_TRANSFER_FROM]) for (const r of facts.get(t)?.rd ?? []) xr.add(r);
   const bal = facts.get(SEL_BALANCE_OF)?.maps ?? new Set<bigint>(), allow = facts.get(SEL_ALLOWANCE)?.maps ?? new Set<bigint>();
   // privileged_balance_move: guarded non-ERC20 function debiting a holder-chosen balance without touching the allowance mapping
-  const moves = cands.filter(s => { const f = facts.get(s.selector)!; return guarded(f) && f.names.has('SSTORE') && f.names.has('CALLDATALOAD') && f.names.has('DEBIT') && intersects(f.maps, bal) && !intersects(f.maps, allow); });
+  // a SUB (possibly in a checked_sub helper block) and an SSTORE on a walk that hashes the balance mapping; only an allowance WRITE excludes (reading it does not authorise the move)
+  const moves = cands.filter(s => { const f = facts.get(s.selector)!; return guarded(f) && f.names.has('SSTORE') && f.names.has('SUB') && f.names.has('CALLDATALOAD') && intersects(f.okeys, bal) && !intersects(f.wmaps, allow); }); // okeys: a balance hash keyed by something other than msg.sender (a self-burn is not a seizure)
   if (moves.length) {
     const ren = facts.get(SEL_RENOUNCE);
     const survives = ren !== undefined && ren.wr.size > 0 && moves.some(s => !intersects(facts.get(s.selector)!.guard, ren.wr));
-    out.push({ tag: 'privileged_balance_move', severity: 'high', detail: `CALLER-guarded function reaches a balance-mapping write for a calldata-chosen account without reading the allowance mapping${survives ? ' (survives renounceOwnership)' : ''}`, functions: moves.map(fn) });
+    const proven = moves.some(s => intersects(facts.get(s.selector)!.cdmaps, bal)); // the hashed balance key was seen to come from calldata
+    out.push({ tag: 'privileged_balance_move', severity: 'high', detail: `CALLER-guarded function reaches a balance-mapping write and a subtraction without writing the allowance mapping${proven ? ' for a calldata-chosen account' : ' (calldata-chosen account not proven: may be a self-balance move)'}${survives ? ' (survives renounceOwnership)' : ''}`, functions: moves.map(fn) });
   }
   if (hasOwner) {
     const hits = cands.map(s => { const f = facts.get(s.selector)!; return { s, f, slots: [...f.wr].filter(w => xr.has(w) && !f.guard.has(w)) }; })
@@ -465,7 +544,7 @@ function behaviourFlags(ops: Op[], byPc: Map<number, number>, dests: Set<number>
 // ---- flags ----
 /** Address constant from PUSH20, or a wider PUSH (immutable-style zero-padded word) whose value fits 160 bits and is >= 12 bytes; '0x'+40 hex, or null. */
 function addrConst(o: Op): string | null {
-  if (o.op < 0x73 || !o.data) return null;
+  if (o.op < 0x6b || !o.data) return null; // PUSH12 and wider: addresses with leading zero bytes are pushed narrower
   const t = o.data.replace(/^0+/, '');
   if (o.op === 0x73) return /^f+$/.test(o.data) ? null : '0x' + o.data;
   return t.length < 24 || t.length > 40 || /^f+$/.test(t) ? null : '0x' + t.padStart(40, '0');
@@ -492,9 +571,10 @@ function detectFlags(ops: Op[], byPc: Map<number, number>, flow: Flow, stripped:
     addrs.set(a, [...(addrs.get(a) ?? []), o.pc]);
     const i = byPc.get(o.pc)!, w = ops.slice(Math.max(0, i - 6), i + 7);
     // address const vs CALLER/ORIGIN through EQ (or SUB/XOR + ISZERO), either operand order, DUP/SWAP between
-    if (w.some(x => x.name === 'CALLER' || x.name === 'ORIGIN') && hasCmp(new Set(w.map(x => x.name)))) privileged.set(a, [...(privileged.get(a) ?? []), o.pc, ...w.filter(x => x.name === 'CALLER' || x.name === 'ORIGIN').map(x => x.pc)]);
+    // (dropped when the simulation already found a caller comparison in the window: it reports the constant actually compared)
+    if (!w.some(x => flow.callerCmps.has(x.pc)) && w.some(x => x.name === 'CALLER' || x.name === 'ORIGIN') && hasCmp(new Set(w.map(x => x.name)))) privileged.set(a, [...(privileged.get(a) ?? []), o.pc, ...w.filter(x => x.name === 'CALLER' || x.name === 'ORIGIN').map(x => x.pc)]);
   });
-  for (const [pc, v] of flow.callerCmps) { const a = '0x' + v.toString(16).padStart(40, '0'); privileged.set(a, [...(privileged.get(a) ?? []), pc]); } // primary: simulated comparison; the window above is the backstop
+  for (const [pc, v] of flow.callerCmps) { const a = '0x' + v.toString(16).padStart(40, '0'); privileged.set(a, [...(privileged.get(a) ?? []), pc]); addrs.set(a, [...(addrs.get(a) ?? []), pc]); } // derived constants (ADD/NOT/shift forms) also feed known_scam_address // primary: simulated comparison; the window above is the backstop
   let nPriv = 0; // bound: attribution costs walks x sites per flag, so report at most 64 distinct addresses (already a maximal red flag)
   for (const [a, sites] of privileged) {
     if (sigs.allowCallers[a]) add('allowed_caller', 'info', sigs.allowCallers[a], sites);

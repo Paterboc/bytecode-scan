@@ -314,20 +314,24 @@ test('repro: PoolManager guard shared with a computed fallback route is still fl
 
 // WHY: operator moves/burns any holder's balance without allowance is a confiscation capability; a consumer can block on high.
 const mapOf = (slot) => '60' + slot + '6020' + '52'; // MSTORE(0x20, slot): mapping slot about to be hashed
-const KECC = '60205f20'; // PUSH1 0x20 PUSH0 KECCAK256
-const BAL = ['70a08231', mapOf('00') + KECC + '5400'];
-const ALLOW = ['dd62ed3e', mapOf('01') + KECC + '5400'];
+const KECC = '60405f20'; // KECCAK256(0, 0x40)
+const KEYCD = '5f355f52'; // MSTORE(0, CALLDATALOAD(0)): the mapping key
+const BAL = ['70a08231', KEYCD + mapOf('00') + KECC + '5400'];
+const ALLOW = ['dd62ed3e', KEYCD + mapOf('01') + KECC + '5400'];
 const GUARD6 = '33' + '600654' + '14'; // CALLER == SLOAD(6)
-const debit = (op) => '5f3550' + mapOf('00') + KECC + '8054' + '6001' + '90' + op + '9055' + '00'; // balance[arg] = balance[arg] -/+ 1
+const debit = (op) => KEYCD + mapOf('00') + KECC + '8054' + '6001' + '90' + op + '9055' + '00'; // balance[arg] = balance[arg] -/+ 1
 test('privileged_balance_move: guarded debit of a calldata-chosen balance without allowance', () => {
   const RENOUNCE = ['715018a6', '6000' + '6005' + '55' + '00']; // clears slot 5 only
   const f = find(contract([BAL, ALLOW, RENOUNCE, ['11223344', GUARD6 + debit('03')]]), 'privileged_balance_move');
   assert.equal(f.severity, 'high');
   assert.deepEqual(f.functions, [{ selector: '0x11223344', name: null }]);
   assert.match(f.detail, /survives renounceOwnership/);
-  // credit (mint-like) is not a debit; reading the allowance mapping is the legitimate transferFrom shape; unguarded is a plain function
+  // credit (mint-like, no SUB) is not a debit; unguarded is a plain function; reading the allowance mapping does NOT exempt, writing it does (transferFrom shape)
   assert.ok(!tags(contract([BAL, ALLOW, ['11223344', GUARD6 + debit('01')]])).includes('privileged_balance_move'));
-  assert.ok(!tags(contract([BAL, ALLOW, ['11223344', GUARD6 + mapOf('01') + debit('03')]])).includes('privileged_balance_move'));
+  const readsAllowance = GUARD6 + KEYCD + mapOf('01') + KECC + '5450' + debit('03');
+  assert.ok(tags(contract([BAL, ALLOW, ['11223344', readsAllowance]])).includes('privileged_balance_move'));
+  const writesAllowance = GUARD6 + KEYCD + mapOf('01') + KECC + '6001' + '90' + '55' + debit('03'); // SSTORE(allowance hash, 1)
+  assert.ok(!tags(contract([BAL, ALLOW, ['11223344', writesAllowance]])).includes('privileged_balance_move'));
   assert.ok(!tags(contract([BAL, ALLOW, ['11223344', debit('03')]])).includes('privileged_balance_move'));
 });
 
