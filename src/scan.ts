@@ -156,7 +156,7 @@ function wordString(hex: string): string | null {
  * a flood of fall-through selector compares makes every walk traverse the same long chain. Real tokens use a tiny fraction (corpus: <= 81 selectors).
  * When exceeded the walks stop and scanBytecode emits `analysis_budget_exceeded`; the O(n) linear-floor HIGH checks still run.
  */
-const MAX_WORK_OPS = 1_000_000, MAX_SELECTORS = 1000;
+const MAX_WORK_OPS = 400_000, MAX_SELECTORS = 1000;
 const MAX_BYTES = 4_000_000, MAX_STR = 1024, MAX_COPY = 256, MAX_QUEUE = 512; // listing/string bytes per scan, chars per revert string, bytes read per CODECOPY, pending blocks per walk
 const budget = { left: MAX_WORK_OPS, bytes: MAX_BYTES, exceeded: false };
 const spend = (): boolean => { if (budget.left-- <= 0) budget.exceeded = true; return !budget.exceeded; };
