@@ -26,7 +26,9 @@ export interface ScanResult {
   selectors: Selector[]; functions: FuncListing[]; flags: Flag[];
 }
 
-interface Signatures { codeHashes: Record<string, string>; addresses: Record<string, string>; skeletons: Record<string, string>; allowCallers: Record<string, string> }
+interface Signatures { codeHashes: Record<string, string>; addresses: Record<string, string>; skeletons: Record<string, string>; allowCallers: Record<string, string | AllowEntry> }
+/** allowCallers value: a plain label string (unscoped, any token) or a label scoped to the skeletonHashes of the templates allowed to use that caller. */
+interface AllowEntry { label: string; skeletons: string[] }
 const sigs = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'signatures.json'), 'utf8')) as Signatures;
 sigs.skeletons ??= {}; sigs.allowCallers ??= {};
 
@@ -36,7 +38,12 @@ export function loadSignatures(file: string): void {
   for (const k of ['codeHashes', 'addresses', 'skeletons', 'allowCallers'] as const) {
     const t = j[k] ?? {};
     if (typeof t !== 'object' || Array.isArray(t)) throw new Error(`"${k}" must be an object`);
-    for (const [key, v] of Object.entries(t)) sigs[k][key.toLowerCase()] = String(v);
+    for (const [key, v] of Object.entries(t)) {
+      if (k === 'allowCallers' && v !== null && typeof v === 'object') { // scoped form; no skeletons listed = never matches (fails closed)
+        const e = v as Partial<AllowEntry>;
+        sigs.allowCallers[key.toLowerCase()] = { label: String(e.label ?? ''), skeletons: Array.isArray(e.skeletons) ? e.skeletons.map(x => String(x).toLowerCase()) : [] };
+      } else (sigs[k] as Record<string, string>)[key.toLowerCase()] = String(v);
+    }
   }
 }
 
@@ -333,7 +340,7 @@ function simulate(ops: Op[]): Flow {
 }
 const bit160 = 1n << 160n, MASK160 = bit160 - 1n;
 /** Address-sized constant: 12..20 significant bytes, not the 160-bit all-ones mask. */
-const addrSized = (v: bigint): boolean => v >= 1n << 92n && v < bit160 && v !== MASK160;
+const addrSized = (v: bigint): boolean => v >= 1n << 92n && v < bit160 && (v & (v + 1n)) !== 0n; // not a 2^k-1 mask
 function simulateOnce(ops: Op[], seeds: Seeds, frames: Map<number, El[] | null>, out: Seeds): Flow {
   const jumps = new Map<number, V>(), rets = new Map<number, number[]>(), keys = new Map<number, bigint>(), guards = new Map<number, bigint[]>(), maps = new Map<number, bigint>(), debits = new Set<number>(), callerCmps = new Map<number, bigint>(), stores = new Map<number, bigint>(), cdMaps = new Map<number, bigint>(), otherKeys = new Map<number, bigint>();
   const st: El[] = []; let pending: number[] = []; const small = (ops[ops.length - 1]?.pc ?? 0) < 256;
@@ -556,7 +563,7 @@ interface Raised { flag: Flag; sites: number[]; anyLive: boolean; allLive: boole
  * opcode flags (SELFDESTRUCT/DELEGATECALL/CALLCODE) over the code region (before the metadata tail) plus any tail op proven reachable.
  * Reachability only attributes functions and gates exemptions; it never decides whether a HIGH flag fires.
  */
-function detectFlags(ops: Op[], byPc: Map<number, number>, flow: Flow, stripped: Buffer, strippedHash: string, live: Set<number>): Raised[] {
+function detectFlags(ops: Op[], byPc: Map<number, number>, flow: Flow, stripped: Buffer, strippedHash: string, skeleton: string, live: Set<number>): Raised[] {
   const flags: Raised[] = [];
   const add = (tag: string, severity: 'high' | 'medium' | 'info', detail: string, sites: number[] = []): void => {
     const anyLive = sites.some(p => live.has(p));
@@ -577,7 +584,9 @@ function detectFlags(ops: Op[], byPc: Map<number, number>, flow: Flow, stripped:
   for (const [pc, v] of flow.callerCmps) { const a = '0x' + v.toString(16).padStart(40, '0'); privileged.set(a, [...(privileged.get(a) ?? []), pc]); addrs.set(a, [...(addrs.get(a) ?? []), pc]); } // derived constants (ADD/NOT/shift forms) also feed known_scam_address // primary: simulated comparison; the window above is the backstop
   let nPriv = 0; // bound: attribution costs walks x sites per flag, so report at most 64 distinct addresses (already a maximal red flag)
   for (const [a, sites] of privileged) {
-    if (sigs.allowCallers[a]) add('allowed_caller', 'info', sigs.allowCallers[a], sites);
+    const ac = sigs.allowCallers[a]; // a scoped entry only downgrades inside its listed templates; elsewhere the same constant stays HIGH
+    const allowed = typeof ac === 'string' ? ac : ac && ac.skeletons.includes(skeleton) ? ac.label : null;
+    if (allowed !== null && allowed !== undefined) add('allowed_caller', 'info', allowed, sites);
     else if (nPriv++ < 64) add('hardcoded_privileged_caller', 'high', a, sites);
   }
   for (const [n, t] of [['SELFDESTRUCT', 'selfdestruct'], ['DELEGATECALL', 'delegatecall'], ['CALLCODE', 'callcode']] as const) if (names.has(n)) add(t, 'high', n, floor.filter(o => o.name === n).map(o => o.pc));
@@ -605,7 +614,8 @@ export function scanBytecode(hex: string): ScanResult {
   const walks = selectors.map(s => ({ ...s, ...listFunction(ops, byPc, dests, s.entry, code) }));
   const functions = walks.map(({ pcs: _p, ...f }) => f);
   const fbEntry = selectors.length ? fallbackEntry(ops) : null;
-  const flags = detectFlags(ops, byPc, flow, stripped, strippedCodeHash, live);
+  const skeleton = skeletonHash(stripped);
+  const flags = detectFlags(ops, byPc, flow, stripped, strippedCodeHash, skeleton, live);
   const fb = fbEntry !== null && flags.some(f => f.sites.length) ? listFunction(ops, byPc, dests, fbEntry, code).pcs : new Set<number>();
   for (const f of flags) {
     f.flag.functions = walks.filter(w => f.sites.some(p => w.pcs.has(p))).map(w => ({ selector: w.selector, name: w.name }));
@@ -619,7 +629,6 @@ export function scanBytecode(hex: string): ScanResult {
   const out = kept.map(f => f.flag).concat(behaviourFlags(ops, byPc, dests, flow, selectors, privileged, fbEntry));
   if (selectors.length && !selectors.some(s => s.selector === '0x8da5cb5b')) out.push({ tag: 'no_owner_getter', severity: 'info', detail: 'no owner() selector', functions: [] });
   if (budget.exceeded) out.push({ tag: 'analysis_budget_exceeded', severity: 'high', detail: 'contract too large or complex to analyse; treat as unverified', functions: [] });
-  const skeleton = skeletonHash(stripped);
   if (sigs.skeletons[skeleton]) out.push({ tag: 'known_template', severity: 'info', detail: sigs.skeletons[skeleton], functions: [] });
   return { size: code.length, strippedSize: stripped.length, codeHash: keccak256(code), strippedCodeHash, skeletonHash: skeleton, selectors, functions, flags: out };
 }

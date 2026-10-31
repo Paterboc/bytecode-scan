@@ -427,3 +427,18 @@ test('allowCallers table turns a hardcoded caller into info allowed_caller', () 
   assert.equal(a.severity, 'info');
   assert.equal(a.detail, 'known infra');
 });
+
+// WHY: an infrastructure address is only benign inside the template that uses it; the same constant in different code must stay HIGH.
+test('allowCallers scoped to skeletons: allowed only inside the listed template', () => {
+  const a = '0x73' + ADDR + '331450' + '00', b = '0x73' + ADDR + '331450' + '5f5000'; // same constant, different code
+  const f = join(mkdtempSync(join(tmpdir(), 'sig-')), 'sigs.json');
+  const sk = scanBytecode(a).skeletonHash;
+  assert.notEqual(sk, scanBytecode(b).skeletonHash);
+  writeFileSync(f, JSON.stringify({ allowCallers: { ['0x' + ADDR]: { label: 'scoped infra', skeletons: [sk] } } }));
+  const run = (hex) => JSON.parse(execFileSync('node', ['dist/cli.js', '--hex', hex, '--json', '--signatures', f])).flags;
+  assert.equal(run(a).find(x => x.tag === 'allowed_caller').detail, 'scoped infra');
+  assert.ok(!run(a).some(x => x.tag === HC));
+  assert.ok(run(b).some(x => x.tag === HC) && !run(b).some(x => x.tag === 'allowed_caller'));
+  writeFileSync(f, JSON.stringify({ allowCallers: { ['0x' + ADDR]: { label: 'no scope' } } })); // no skeletons listed: never matches
+  assert.ok(run(a).some(x => x.tag === HC));
+});
