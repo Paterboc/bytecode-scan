@@ -366,3 +366,16 @@ test('known_template from the signatures skeletons table; text mode prints the h
   assert.equal(j.skeletonHash, sk);
   assert.match(execFileSync('node', ['dist/cli.js', '--hex', hex, '--no-listing']).toString(), new RegExp('skeleton hash +' + sk));
 });
+
+// WHY: a flood of fall-through selector compares made every per-function walk traverse the whole dispatcher (quadratic time and memory, OOM at ~96 KB).
+test('selector flood at 96 KB is bounded and flagged analysis_budget_exceeded, with the linear HIGH checks still run', () => {
+  let h = '5b', i = 1; // JUMPDEST at pc 0; every selector jumps back to it
+  while (h.length / 2 < 98304 - 40) h += '63' + (0x10000000 + i++).toString(16).padStart(8, '0') + '14' + '610000' + '57';
+  h += '73' + ADDR + '331450' + '00';
+  const t0 = Date.now(), r = scanBytecode('0x' + h);
+  assert.ok(Date.now() - t0 < 5000, 'took ' + (Date.now() - t0) + ' ms');
+  const f = r.flags.find(x => x.tag === 'analysis_budget_exceeded');
+  assert.equal(f.severity, 'high');
+  assert.ok(r.flags.some(x => x.tag === 'hardcoded_privileged_caller'));
+  assert.ok(!tags(contract([['a9059cbb', '00']])).includes('analysis_budget_exceeded')); // ordinary code never trips it
+});

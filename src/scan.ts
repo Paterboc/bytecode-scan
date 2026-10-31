@@ -54,6 +54,7 @@ export const FLAG_EXPLAIN: Record<string, string> = {
   self_liquidity: 'The token itself exposes removeLiquidity-style or Uniswap v4 unlockCallback selectors: it can manage or remove its own pool liquidity.',
   privileged_balance_move: 'A function guarded by a CALLER check against stored state debits a balance-mapping entry for an account taken from calldata without consulting the allowance mapping: the guarded role can move or burn any holder\'s balance.',
   admin_role: 'Info: a CALLER-guarded state write exists with no owner() getter, but it does not reach balances, allowances, supply or a transfer gate.',
+  analysis_budget_exceeded: 'The contract is too large or complex for the bounded per-function analysis (too many selectors or walked ops): function listings and the behavioural flags are incomplete. Treat as unverified. The whole-code HIGH pattern checks still ran.',
   known_template: 'Info: the skeleton hash (immutable- and metadata-insensitive fingerprint) matches an entry in the loaded signatures file.',
   no_owner_getter: 'Info: no owner() selector; owner-based probes are not applicable.',
 };
@@ -149,18 +150,28 @@ function wordString(hex: string): string | null {
   return printable(b.subarray(0, end)) ? b.subarray(0, end).toString('latin1') : null;
 }
 
+/**
+ * Global work budget for the per-function walks (listing, flag attribution, storage facts), reset per scan. The walks are the only super-linear part:
+ * a flood of fall-through selector compares makes every walk traverse the same long chain. Real tokens use a tiny fraction (corpus: <= 81 selectors).
+ * When exceeded the walks stop and scanBytecode emits `analysis_budget_exceeded`; the O(n) linear-floor HIGH checks still run.
+ */
+const MAX_WORK_OPS = 1_000_000, MAX_SELECTORS = 1000;
+const budget = { left: MAX_WORK_OPS, exceeded: false };
+const spend = (): boolean => { if (budget.left-- <= 0) budget.exceeded = true; return !budget.exceeded; };
+
 function listFunction(ops: Op[], byPc: Map<number, number>, dests: Set<number>, entry: number, code: Buffer): { lines: string[]; pcs: Set<number> } {
   const lines: string[] = []; const pcs = new Set<number>(); // pcs: every op the bounded walk visited (flag attribution)
   const queue = [entry]; const seen = new Set<number>();
   const MAX_BLOCKS = 80, MAX_LINES = 120;
   let strWords: string[] = []; let cond: string | null = null; // function-scoped: revert strings are built in shared helper blocks
-  while (queue.length && seen.size < MAX_BLOCKS && lines.length < MAX_LINES) {
+  while (queue.length && seen.size < MAX_BLOCKS && lines.length < MAX_LINES && !budget.exceeded) {
     const start = queue.shift()!;
     if (seen.has(start) || (start !== entry && !dests.has(start)) || !byPc.has(start)) continue;
     seen.add(start);
     let labelled = false;
     const push = (l: string): void => { if (!labelled) { lines.push(`@0x${start.toString(16)}:`); labelled = true; } lines.push('  ' + l); };
     for (let i = byPc.get(start)!; i < ops.length; i++) {
+      if (!spend()) break;
       const o = ops[i]; const prev = ops[i - 1]; pcs.add(o.pc);
       const prevData = prev?.data !== undefined ? prev.data.replace(/^0+(?=.)/, '') : '';
       let line: string | null = null;
@@ -362,10 +373,11 @@ interface Facts { names: Set<string>; rd: Slots; wr: Slots; guard: Slots; maps: 
 function reachFacts(ops: Op[], byPc: Map<number, number>, dests: Set<number>, flow: Flow, entry: number): Facts {
   // ponytail: slots come from intra-block constant propagation; unresolved keys fall back to a nearby-PUSH1/2 heuristic. Capped at 4000 ops.
   const names = new Set<string>(), rd: Slots = new Set(), wr: Slots = new Set(), guard: Slots = new Set(), maps: Slots = new Set(), seen = new Set<number>(); const q = [entry]; let n = 0;
-  while (q.length && n < 4000) {
+  while (q.length && n < 4000 && !budget.exceeded) {
     const p = q.pop()!; if (seen.has(p) || !byPc.has(p)) continue;
     seen.add(p);
     for (let i = byPc.get(p)!; i < ops.length; n++) {
+      if (!spend()) break;
       const o = ops[i];
       if (o.op === 0x56 || o.op === 0x57) for (const t of jumpSuccessors(flow, o)) if (dests.has(t) && !seen.has(t)) q.push(t);
       names.add(o.name);
@@ -491,7 +503,9 @@ export function scanBytecode(hex: string): ScanResult {
   const dests = new Set(ops.filter(o => o.name === 'JUMPDEST').map(o => o.pc));
   const flow = simulate(ops);
   const { live, computed } = livePcs(ops, byPc, dests, flow, code.length);
-  const selectors = extractSelectors(ops);
+  budget.left = MAX_WORK_OPS; budget.exceeded = false;
+  let selectors = extractSelectors(ops);
+  if (selectors.length > MAX_SELECTORS) { selectors = selectors.slice(0, MAX_SELECTORS); budget.exceeded = true; }
   const walks = selectors.map(s => ({ ...s, ...listFunction(ops, byPc, dests, s.entry, code) }));
   const functions = walks.map(({ pcs: _p, ...f }) => f);
   const fbEntry = selectors.length ? fallbackEntry(ops) : null;
@@ -508,6 +522,7 @@ export function scanBytecode(hex: string): ScanResult {
   const privileged = new Set(kept.filter(f => f.flag.tag === 'hardcoded_privileged_caller').flatMap(f => f.flag.functions.map(x => x.selector)));
   const out = kept.map(f => f.flag).concat(behaviourFlags(ops, byPc, dests, flow, selectors, privileged, fbEntry));
   if (selectors.length && !selectors.some(s => s.selector === '0x8da5cb5b')) out.push({ tag: 'no_owner_getter', severity: 'info', detail: 'no owner() selector', functions: [] });
+  if (budget.exceeded) out.push({ tag: 'analysis_budget_exceeded', severity: 'high', detail: 'contract too large or complex to analyse; treat as unverified', functions: [] });
   const skeleton = skeletonHash(stripped);
   if (sigs.skeletons[skeleton]) out.push({ tag: 'known_template', severity: 'info', detail: sigs.skeletons[skeleton], functions: [] });
   return { size: code.length, strippedSize: stripped.length, codeHash: keccak256(code), strippedCodeHash, skeletonHash: skeleton, selectors, functions, flags: out };
