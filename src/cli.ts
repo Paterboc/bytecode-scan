@@ -143,7 +143,10 @@ async function main(): Promise<void> {
             const code = await getCode(url, impl, T);
             if (!valid(code)) throw new Error(`no code at ${impl}`);
             targets.push({ title: `${impl} (implementation via ${how})`, address: impl, result: scanBytecode(code), raw: code, chain: w.chain, rpcErrors, incomplete: [] });
-          } else console.error('--follow-proxy: no proxy pattern detected');
+          } else {
+            console.error('--follow-proxy: no proxy pattern detected');
+            if (main.result.flags.some(f => f.tag === 'delegatecall')) main.incomplete.push('follow-proxy: delegatecall target not resolved (no proxy pattern detected)'); // the code delegates somewhere we could not identify
+          }
         } catch (e) {
           const m = `follow-proxy: implementation unavailable: ${(e as Error).message}`;
           console.error('--' + m); main.incomplete.push(m);

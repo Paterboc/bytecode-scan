@@ -233,11 +233,11 @@ export const EIP1967_IMPL_SLOT = '360894a13ba1a3210667c828492db98dca3e2076cc3735
 /** Pre-EIP-1967 OpenZeppelin (zos) slot: keccak256('org.zeppelinos.proxy.implementation'), e.g. USDC's FiatTokenProxy. */
 export const ZOS_IMPL_SLOT = '7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3';
 export const EIP1967_BEACON_SLOT = 'a3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50';
-const MIN_PROXY = /^363d3d373d3d3d363d73([0-9a-f]{40})5af43d82803e903d91602b57fd5bf3/;
+const MIN_PROXY = /^(?:363d3d373d3d3d363d73([0-9a-f]{40})5af43d82803e903d91602b57fd5bf3|3d3d3d3d363d3d37363d73([0-9a-f]{40})5af43d3d93803e602a57fd5bf3)/; // EIP-1167 (45 B) and the 44 B optimised clone
 /** Implementation address embedded in an EIP-1167 minimal proxy, or null. */
 export const minimalProxyTarget = (code: Buffer): string | null => {
   const m = MIN_PROXY.exec(code.toString('hex'));
-  return m ? '0x' + m[1] : null;
+  return m ? '0x' + (m[1] ?? m[2]) : null;
 };
 
 /** Op pcs reachable from the dispatcher fallthrough (code after the last `PUSH4 sel EQ PUSH JUMPI`), or empty. */

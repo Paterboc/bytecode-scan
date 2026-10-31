@@ -442,3 +442,31 @@ test('allowCallers scoped to skeletons: allowed only inside the listed template'
   writeFileSync(f, JSON.stringify({ allowCallers: { ['0x' + ADDR]: { label: 'no scope' } } })); // no skeletons listed: never matches
   assert.ok(run(a).some(x => x.tag === HC));
 });
+
+test('44-byte optimised clone is followed like EIP-1167', () => {
+  const t = scanBytecode('0x3d3d3d3d363d3d37363d73' + ADDR + '5af43d3d93803e602a57fd5bf3').flags.find(f => f.tag === 'minimal_proxy');
+  assert.equal(t.detail, `EIP-1167 -> 0x${ADDR}`);
+});
+// WHY: a delegatecall whose target --follow-proxy cannot identify means the scan did not cover what runs; consumers must not read it as complete.
+test('--follow-proxy: unresolved delegatecall target is reported in incomplete', async () => {
+  const { createServer } = await import('node:http');
+  const { execFile } = await import('node:child_process');
+  const token = '0x' + 'd3'.repeat(20), code = '0x5f355af400';
+  const srv = createServer((req, res) => {
+    let b = ''; req.on('data', d => b += d); req.on('end', () => {
+      const j = JSON.parse(b); const result = j.method === 'eth_getCode' ? (j.params[0] === token ? code : '0x') : '0x' + '00'.repeat(32);
+      res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ jsonrpc: '2.0', id: j.id, result }));
+    });
+  });
+  await new Promise(r => srv.listen(0, '127.0.0.1', r));
+  try {
+    const out = await new Promise(r => execFile('node', ['dist/cli.js', token, '--rpc', `http://127.0.0.1:${srv.address().port}`, '--follow-proxy', '--json', '--no-listing'], (e, o) => r(o)));
+    assert.ok(JSON.parse(out).incomplete.some(m => /delegatecall target not resolved/.test(m)));
+  } finally { srv.close(); }
+});
+
+// WHY: an address with leading zero bytes is pushed narrower than PUSH20 (PUSH12..PUSH19) but is still an address.
+test('narrow-pushed address (leading zero bytes) is a caller constant', () => {
+  assert.ok(tags('0x6b' + 'a1'.repeat(12) + '33' + '14' + '00').includes(HC)); // PUSH12 CALLER EQ
+  assert.ok(!tags('0x6b' + '00'.repeat(11) + '01' + '33' + '14' + '00').includes(HC)); // a small number is not an address
+});

@@ -73,11 +73,21 @@ npm test    # builds, then runs node:test over synthetic bytecode; no network
 
 ## Limits
 
-- HIGH flags use a whole-code floor, so a crafted jump cannot hide them from reachability analysis: the address-constant caller check (`hardcoded_privileged_caller`) and `known_scam_address` are matched over the entire code including any metadata-like tail; `selfdestruct`, `delegatecall` and `callcode` are matched over the code region only (before the metadata tail, which is noisy for opcodes) plus any tail op proven reachable. Hits not proven reachable keep their severity and are attributed to `unreachable/unknown` (or noted in `detail`), so data can add false positives. Reachability only attributes functions and gates the PoolManager exemption. A jump into a forged tail that hides an opcode-only flag (for example a bare `delegatecall`) is not caught.
-- Pattern matching, not dataflow: a privileged address assembled at run time (loaded from code or memory, built with shifts/OR, or `CALLER` stashed in memory and compared far from the constant) is not recognised, and `owner_switch`/`hidden_admin`/`privileged_balance_move` follow storage slots and mappings only within a basic block, so switch logic split across blocks or helper functions can be missed. When a reachable jump target is computed in-block, or is carried in with no return label anywhere in the contract, every JUMPDEST is treated as reachable, which can add false positives.
-- Known-hash matching is exact: appending or changing any byte defeats `known_scam_codehash`.
+What is matched, and how far:
+- **Whole-code floor.** The address-constant caller check (`hardcoded_privileged_caller`, `allowed_caller`) and `known_scam_address` are matched over the entire code, including any metadata-like tail, so a crafted jump cannot hide them from reachability analysis. `selfdestruct`, `delegatecall` and `callcode` are matched over the code region only (before the metadata tail, which is noisy for opcodes) plus any tail op proven reachable; a jump into a forged tail that hides an opcode-only flag is not caught. Hits not proven reachable keep their severity and are attributed to `unreachable/unknown` (or noted in `detail`), so data can add false positives.
+- **Bounded analysis.** The per-function walks stop at a global budget (400,000 ops, 16,000 per walk), at 1,000 selectors, and at 4 MB of produced listing/string text per scan. When any is exceeded the result carries `analysis_budget_exceeded` (high): listings and behavioural flags are incomplete, the whole-code checks above still ran.
+- **Dataflow is shallow.** Constants, caller/calldata taint and mapping slots are tracked on a stack simulation inside a basic block, with caller/calldata taint seeded across static jumps, fall-through and internal-call returns. Anything beyond that is a miss: `owner_switch`, `hidden_admin` and `privileged_balance_move` can lose a switch whose logic is split across blocks or helper functions.
+
+Known evasions of a static pattern scan (not detected):
+- a privileged address assembled at run time (loaded from code, memory or storage, built with shifts/OR), or `CALLER` stashed in memory and compared far from the constant;
+- the caller reduced before the compare: hashed (`keccak(caller) == c`), truncated (only some bits compared), reduced modulo a constant, or tested against a range with non-address-sized bounds;
+- a role kept in storage or a mapping (`mapping(address => bool)` allow/deny lists, blacklists, a stored owner with no getter) rather than as a compiled-in constant: these are only reachable as `owner_switch`/`hidden_admin`/`admin_role` heuristics;
+- a computed or cross-block jump target into hidden code that also avoids every linear-floor pattern;
+- known-hash matching is exact: appending or changing any byte defeats `known_scam_codehash` (the skeleton hash is insensitive to constants and metadata but not to logic changes).
+- Unresolvable jump targets (computed in-block, or carried with no return label anywhere) make every JUMPDEST count as reachable, which can add false positives.
+
+General:
 - EVM only. Not zkSync Era / EraVM, and not non-EVM chains.
-- Static analysis cannot see storage-based backdoors (roles set at runtime with no getter).
 - This is disassembly with a bounded block walk, not decompilation; listings are hints and can be incomplete.
 - Metadata stripping targets the solc CBOR tail. Vyper contracts may use a different tail; stripping is best-effort there.
 - Built-in public RPCs rate-limit. Behaviour that lives outside the contract's own bytecode is invisible to bytecode analysis.
