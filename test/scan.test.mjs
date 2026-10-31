@@ -124,11 +124,17 @@ test('owner_switch: not raised when transfer does not read the setter slot, or w
 });
 
 // WHY: an admin role with no owner() getter is invisible to owner probes.
-test('hidden_admin: CALLER-guarded state write without owner()', () => {
-  const f = find(contract([['a9059cbb', readsSlot('06')], SETTER]), 'hidden_admin');
+test('hidden_admin: CALLER-guarded write to a transfer-gate slot without owner()', () => {
+  const f = find(contract([['a9059cbb', readsSlot('05')], SETTER]), 'hidden_admin');
   assert.equal(f.severity, 'medium');
   assert.deepEqual(f.functions, [{ selector: '0x11223344', name: null }]);
-  assert.ok(!tags(contract([OWNER, ['a9059cbb', readsSlot('06')], SETTER])).includes('hidden_admin'));
+  assert.ok(!tags(contract([OWNER, ['a9059cbb', readsSlot('05')], SETTER])).includes('hidden_admin'));
+});
+// WHY: a role that only edits metadata is not a transfer-affecting capability: info, not medium.
+test('admin_role: guarded write that reaches no balance/allowance/supply/transfer gate is info', () => {
+  const r = contract([['a9059cbb', readsSlot('06')], SETTER]);
+  assert.equal(find(r, 'admin_role').severity, 'info');
+  assert.ok(!tags(r).includes('hidden_admin'));
 });
 
 test('self_liquidity: removeLiquidity and unlockCallback selectors', () => {
@@ -147,10 +153,13 @@ test('PoolManager guard inside unlockCallback is suppressed; any other constant 
   assert.equal(f.severity, 'high');
 });
 
-// WHY: string/data tails decode as fake ops; only reachable code counts. ASCII-looking constants are NOT exempt (vanity backdoors).
-test('unreachable data tail is ignored; ASCII-looking reachable constant is flagged', () => {
-  assert.ok(!tags('0x00' + '73' + ADDR + '331400').includes('hardcoded_privileged_caller'));
-  assert.ok(!tags('0x00f2').includes('callcode'));
+// WHY: a crafted jump can hide code from any reachability analysis, so reachability only attributes; it never decides a HIGH flag. ASCII-looking constants are NOT exempt (vanity backdoors).
+test('HIGH flags use a linear floor; ASCII-looking constants are flagged', () => {
+  // linear floor: HIGH flags fire on code not proven reachable too, attributed to unreachable/unknown
+  const u = find('0x00' + '73' + ADDR + '331400', 'hardcoded_privileged_caller');
+  assert.equal(u.severity, 'high');
+  assert.deepEqual(u.functions, [{ selector: null, name: 'unreachable/unknown' }]);
+  assert.match(find('0x00f2', 'callcode').detail, /not proven reachable/);
   const text = Buffer.from('backdoorAddrXYZ').toString('hex') + 'c3d4e5f601';
   assert.ok(tags('0x73' + text + '331400').includes('hardcoded_privileged_caller'));
 });
@@ -199,7 +208,7 @@ test('owner_switch: any constant slot, but not the owner slot itself', () => {
 });
 test('hidden_admin: guard in the fallback', () => {
   // dispatcher for transfer only; fallthrough: JUMPDEST CALLER == SLOAD(9) ; SSTORE slot 3
-  const hex = '0x' + '63a9059cbb' + '14' + '61001b' + '57' + '5b' + '33' + '600954' + '14' + '6001' + '6003' + '55' + '00' + '5b00';
+  const hex = '0x' + '63a9059cbb' + '14' + '610016' + '57' + '5b' + '33' + '600954' + '14' + '6001' + '6003' + '55' + '00' + '5b' + '600354' + '00';
   const f = find(hex, 'hidden_admin');
   assert.deepEqual(f.functions, [{ selector: null, name: 'fallback/unknown' }]);
 });
@@ -264,4 +273,60 @@ test('auto: a hung chain times out instead of blocking', async () => {
   const r = await autoDetect('0x' + ADDR, { a: 'ua', b: 'ub' }, (u) => u === 'ua' ? new Promise(() => {}) : Promise.resolve('0x6000'), 50);
   assert.deepEqual(r.found.map(f => f.chain), ['b']);
   assert.match(r.rpcErrors.a, /timeout/);
+});
+
+// ---- permanent repros of attacker constructions from independent reviews (all synthetic) ----
+const HC = 'hardcoded_privileged_caller';
+test('repro: cross-block computed jump (target computed before a JUMPDEST)', () => {
+  assert.ok(tags('0x6004600401' + '5b' + '56' + '00' + '5b' + guardOf(ADDR)).includes(HC));
+});
+test('repro: calldata jump into a forged metadata tail', () => {
+  const body = '5f3556' + 'a1' + '5b' + guardOf(ADDR); // PUSH0 CALLDATALOAD JUMP; 0xa1 (fake CBOR map); JUMPDEST; guard
+  const n = body.length / 2 + 2 - 5; // trailing length makes the "metadata" start at pc 3
+  const hex = '0x' + body + n.toString(16).padStart(4, '0');
+  assert.equal(scanBytecode(hex).strippedSize, 3);
+  assert.ok(tags(hex).includes(HC));
+});
+test('repro: spoofed EIP-1967 tag with calldata-selected fallback delegation', () => {
+  // dispatcher for transfer; fallthrough: CALLDATALOAD as target, GAS, DELEGATECALL; the slot literal is unreachable decoration
+  const hex = '0x' + '63a9059cbb14' + '610014' + '57' + '5f35' + '5af4' + '00' + '5b00' + '7f' + '360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc' + '50';
+  const t = scanBytecode(hex);
+  assert.equal(t.flags.find(f => f.tag === 'delegatecall').severity, 'high');
+  assert.ok(t.flags.some(f => f.tag === 'eip1967_proxy'));
+  assert.ok(t.flags.find(f => f.tag === 'delegatecall').functions.some(x => x.name === 'fallback/unknown'));
+});
+test('repro: reading the switch slot next to the owner check does not hide the switch', () => {
+  // setter reads slot 5 (the switch), then checks CALLER == SLOAD(9) and writes slot 5; only slot 9 is the owner slot
+  const setter = ['11223344', '600554' + '50' + '33' + '600954' + '14' + '6001' + '6005' + '55' + '00'];
+  assert.ok(find(contract([OWNER, ['a9059cbb', readsSlot('05')], setter]), 'owner_switch'));
+});
+test('repro: a literal that equals a JUMPDEST pc (decimals returning 18) is not a jump target', () => {
+  const mk = (pcByte) => contract([OWNER, ['a9059cbb', readsSlot('05')], SETTER, ['313ce567', '60' + pcByte + '5f52' + '60205ff3']]);
+  const entry = scanBytecode(mk('00')).selectors.find(x => x.selector === '0x11223344').entry; // the setter's JUMPDEST
+  const r = scanBytecode(mk(entry.toString(16).padStart(2, '0')));
+  const f = r.flags.find(x => x.tag === 'owner_switch');
+  assert.deepEqual(f.functions.map(x => x.selector), ['0x11223344']); // decimals() must not be listed as a setter
+});
+test('repro: PoolManager guard shared with a computed fallback route is still flagged', () => {
+  const hex = '0x' + '6391dd7346' + '14' + '61002d' + '57' + '6013' + '6000' + '01' + '56' + '000000' + '5b73' + POOL_MANAGER + '33145000' + '5b' + '610013' + '56';
+  assert.ok(tags(hex).includes(HC));
+});
+
+// WHY: operator moves/burns any holder's balance without allowance is a confiscation capability; hans blocks on high.
+const mapOf = (slot) => '60' + slot + '6020' + '52'; // MSTORE(0x20, slot): mapping slot about to be hashed
+const KECC = '60205f20'; // PUSH1 0x20 PUSH0 KECCAK256
+const BAL = ['70a08231', mapOf('00') + KECC + '5400'];
+const ALLOW = ['dd62ed3e', mapOf('01') + KECC + '5400'];
+const GUARD6 = '33' + '600654' + '14'; // CALLER == SLOAD(6)
+const debit = (op) => '5f3550' + mapOf('00') + KECC + '8054' + '6001' + '90' + op + '9055' + '00'; // balance[arg] = balance[arg] -/+ 1
+test('privileged_balance_move: guarded debit of a calldata-chosen balance without allowance', () => {
+  const RENOUNCE = ['715018a6', '6000' + '6005' + '55' + '00']; // clears slot 5 only
+  const f = find(contract([BAL, ALLOW, RENOUNCE, ['11223344', GUARD6 + debit('03')]]), 'privileged_balance_move');
+  assert.equal(f.severity, 'high');
+  assert.deepEqual(f.functions, [{ selector: '0x11223344', name: null }]);
+  assert.match(f.detail, /survives renounceOwnership/);
+  // credit (mint-like) is not a debit; reading the allowance mapping is the legitimate transferFrom shape; unguarded is a plain function
+  assert.ok(!tags(contract([BAL, ALLOW, ['11223344', GUARD6 + debit('01')]])).includes('privileged_balance_move'));
+  assert.ok(!tags(contract([BAL, ALLOW, ['11223344', GUARD6 + mapOf('01') + debit('03')]])).includes('privileged_balance_move'));
+  assert.ok(!tags(contract([BAL, ALLOW, ['11223344', debit('03')]])).includes('privileged_balance_move'));
 });

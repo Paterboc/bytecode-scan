@@ -50,7 +50,9 @@ Exit codes: `0` analysed, `1` `--fail-on` tripped, `2` usage or fetch error.
 | `known_scam_codehash` | high | Metadata-stripped code hash matches an entry in the loaded signatures file. |
 | `known_scam_address` | high | A `PUSH20` constant matches an entry in the loaded signatures file. |
 | `owner_switch` | medium | Has `owner()`, and a function (other than the core ERC20 entry points) guarded by a `CALLER` check against a stored value writes a constant storage slot, other than the guard's own owner slot, that `transfer`/`transferFrom` read: the owner can flip a setting transfers depend on (sell lock, trading switch, limits, blacklist toggle). `functions` lists the setters; `detail` names the slot. |
-| `hidden_admin` | medium | No `owner()`, yet a function (or the dispatcher fallback) is guarded by `CALLER` == a stored constant-slot value and writes state. |
+| `hidden_admin` | medium | No `owner()`, yet a function (or the dispatcher fallback) is guarded by `CALLER` == a stored constant-slot value and writes balances, allowances, supply or a slot that `transfer`/`transferFrom` read. |
+| `admin_role` | info | Same guard with no `owner()`, but the write reaches none of those (for example a metadata-only role). |
+| `privileged_balance_move` | high | A non-ERC20-standard function guarded by `CALLER` == a stored value debits a balance-mapping entry for an account taken from calldata without touching the allowance mapping: the guarded role can move or burn any holder's balance. Detail adds `(survives renounceOwnership)` when `renounceOwnership()` does not clear the guarding slot. |
 | `self_liquidity` | medium | The token exposes `removeLiquidity`-style or Uniswap v4 `unlockCallback` selectors: it can manage or remove its own pool liquidity. |
 | `minimal_proxy` | info | EIP-1167 clone; logic lives at the embedded address. |
 | `eip1967_proxy` | info | Code references the EIP-1967 implementation/beacon slot. |
@@ -68,7 +70,8 @@ npm test    # builds, then runs node:test over synthetic bytecode; no network
 
 ## Limits
 
-- Pattern matching, not dataflow: a privileged address assembled at run time (loaded from code or memory, built with shifts/OR, or `CALLER` stashed in memory and compared far from the constant) is not recognised. Unresolvable jump targets are handled conservatively (all JUMPDESTs in the code region count as reachable), which can add false positives.
+- HIGH flags (`hardcoded_privileged_caller`, `selfdestruct`, `delegatecall`, `callcode`, known-scam matches) use a whole-code floor: every op of the code region (before the metadata tail) is considered whether or not reachability analysis reaches it. Hits not proven reachable keep their severity and are attributed to `unreachable/unknown` (or noted in `detail`), so data tails can add false positives. Reachability only attributes functions and gates the PoolManager exemption.
+- Pattern matching, not dataflow: a privileged address assembled at run time (loaded from code or memory, built with shifts/OR, or `CALLER` stashed in memory and compared far from the constant) is not recognised, and `owner_switch`/`hidden_admin`/`privileged_balance_move` follow storage slots and mappings only within a basic block, so switch logic split across blocks or helper functions can be missed. Unresolvable jump targets are handled conservatively (all JUMPDESTs count as reachable), which can add false positives.
 - Known-hash matching is exact: appending or changing any byte defeats `known_scam_codehash`.
 - EVM only. Not zkSync Era / EraVM, and not non-EVM chains.
 - Static analysis cannot see storage-based backdoors (roles set at runtime with no getter).
