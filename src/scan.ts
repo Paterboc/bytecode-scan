@@ -22,17 +22,18 @@ export interface FlagFunction { selector: string | null; name: string | null }
 export interface Flag { tag: string; severity: 'high' | 'medium' | 'info'; detail: string; functions: FlagFunction[] }
 export interface FuncListing { selector: string; name: string | null; entry: number; lines: string[] }
 export interface ScanResult {
-  size: number; strippedSize: number; codeHash: string; strippedCodeHash: string;
+  size: number; strippedSize: number; codeHash: string; strippedCodeHash: string; skeletonHash: string;
   selectors: Selector[]; functions: FuncListing[]; flags: Flag[];
 }
 
-interface Signatures { codeHashes: Record<string, string>; addresses: Record<string, string> }
+interface Signatures { codeHashes: Record<string, string>; addresses: Record<string, string>; skeletons: Record<string, string> }
 const sigs = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'signatures.json'), 'utf8')) as Signatures;
+sigs.skeletons ??= {};
 
 /** Merge a user-supplied signatures JSON file over the shipped tables. Throws on unreadable/invalid input. */
 export function loadSignatures(file: string): void {
   const j = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<Signatures>;
-  for (const k of ['codeHashes', 'addresses'] as const) {
+  for (const k of ['codeHashes', 'addresses', 'skeletons'] as const) {
     const t = j[k] ?? {};
     if (typeof t !== 'object' || Array.isArray(t)) throw new Error(`"${k}" must be an object`);
     for (const [key, v] of Object.entries(t)) sigs[k][key.toLowerCase()] = String(v);
@@ -53,6 +54,7 @@ export const FLAG_EXPLAIN: Record<string, string> = {
   self_liquidity: 'The token itself exposes removeLiquidity-style or Uniswap v4 unlockCallback selectors: it can manage or remove its own pool liquidity.',
   privileged_balance_move: 'A function guarded by a CALLER check against stored state debits a balance-mapping entry for an account taken from calldata without consulting the allowance mapping: the guarded role can move or burn any holder\'s balance.',
   admin_role: 'Info: a CALLER-guarded state write exists with no owner() getter, but it does not reach balances, allowances, supply or a transfer gate.',
+  known_template: 'Info: the skeleton hash (immutable- and metadata-insensitive fingerprint) matches an entry in the loaded signatures file.',
   no_owner_getter: 'Info: no owner() selector; owner-based probes are not applicable.',
 };
 
@@ -222,6 +224,41 @@ function fallbackEntry(ops: Op[]): number | null {
     if (ops[i].name === 'JUMPI' && isPush(ops[i - 1]) && ops[i - 2].name === 'EQ' && ops.slice(Math.max(0, i - 6), i - 2).some(x => x.name === 'PUSH4') && ops[i + 1]) return ops[i + 1].pc;
   }
   return null;
+}
+
+// ---- skeleton hash ----
+const SKEL_NAMES: Record<number, string> = { 0x00: 'STOP', 0x14: 'EQ', 0x15: 'ISZERO', 0x20: 'KECCAK256', 0x30: 'ADDRESS', 0x31: 'BALANCE', 0x32: 'ORIGIN', 0x33: 'CALLER', 0x34: 'CALLVALUE', 0x35: 'CALLDATALOAD', 0x36: 'CALLDATASIZE',
+  0x3b: 'EXTCODESIZE', 0x3f: 'EXTCODEHASH', 0x40: 'BLOCKHASH', 0x41: 'COINBASE', 0x42: 'TIMESTAMP', 0x43: 'NUMBER', 0x44: 'PREVRANDAO', 0x45: 'GASLIMIT', 0x3a: 'GASPRICE', 0x48: 'BASEFEE', 0x47: 'SELFBALANCE',
+  0x54: 'SLOAD', 0x55: 'SSTORE', 0x56: 'JUMP', 0x57: 'JUMPI', 0x5a: 'GAS', 0x5b: 'JUMPDEST', 0x5c: 'TLOAD', 0x5d: 'TSTORE', 0x5f: 'PUSH0', 0xf0: 'CREATE', 0xf1: 'CALL', 0xf2: 'CALLCODE', 0xf3: 'RETURN',
+  0xf4: 'DELEGATECALL', 0xf5: 'CREATE2', 0xfa: 'STATICCALL', 0xfd: 'REVERT', 0xfe: 'INVALID', 0xff: 'SELFDESTRUCT', 0x10: 'LT', 0x11: 'GT', 0x12: 'SLT', 0x13: 'SGT', 0x16: 'AND', 0x1b: 'SHL', 0x1c: 'SHR',
+  0x46: 'CHAINID', 0x3d: 'RETURNDATASIZE', 0x39: 'CODECOPY', 0x3c: 'EXTCODECOPY', 0x38: 'CODESIZE' };
+const TOPIC_WORDS = new Set(['ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', '8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925']); // ERC20 Transfer / Approval topics
+/**
+ * Immutable- and metadata-insensitive fingerprint: keccak of the reachable op stream of the metadata-stripped code, with PUSH data kept only for
+ * PUSH1/2/4 (jump targets, selectors) and the ERC20 event topics, so clones with different embedded addresses/constants share one hash.
+ * Op names outside SKEL_NAMES hash as their hex byte; the format is fixed so hashes stay comparable across versions.
+ * ponytail: reachability here follows only PUSH<=4-byte JUMPDEST targets (no stack tracking), by definition of the fingerprint.
+ */
+function skeletonHash(stripped: Buffer): string {
+  const ops = disassemble(stripped);
+  const byPc = new Map(ops.map((o, i) => [o.pc, i])); const dests = new Set(ops.filter(o => o.op === 0x5b).map(o => o.pc));
+  const live = new Set<number>(); const q = [0];
+  while (q.length) {
+    let i = byPc.get(q.pop()!); if (i === undefined) continue;
+    for (; i < ops.length && !live.has(i); i++) {
+      const o = ops[i]; live.add(i);
+      if (o.data && o.data.length <= 8) { const v = parseInt(o.data, 16); if (dests.has(v) && !live.has(byPc.get(v)!)) q.push(v); }
+      if (TERMINATORS.has(o.name)) break;
+    }
+  }
+  const toks: string[] = [];
+  ops.forEach((o, i) => {
+    if (!live.has(i)) return;
+    const b = o.op, name = b >= 0x60 && b <= 0x7f ? `PUSH${b - 0x5f}` : b >= 0xa0 && b <= 0xa4 ? `LOG${b - 0xa0}` : SKEL_NAMES[b] ?? 'X' + b.toString(16).padStart(2, '0');
+    const keep = o.data !== undefined && (o.name === 'PUSH1' || o.name === 'PUSH2' || o.name === 'PUSH4' || (o.name === 'PUSH32' && TOPIC_WORDS.has(o.data)));
+    toks.push(name + (keep ? o.data : ''));
+  });
+  return keccak256(Buffer.from(toks.join(' '), 'utf8'));
 }
 
 // ---- reachability, stack simulation and per-function facts ----
@@ -471,5 +508,7 @@ export function scanBytecode(hex: string): ScanResult {
   const privileged = new Set(kept.filter(f => f.flag.tag === 'hardcoded_privileged_caller').flatMap(f => f.flag.functions.map(x => x.selector)));
   const out = kept.map(f => f.flag).concat(behaviourFlags(ops, byPc, dests, flow, selectors, privileged, fbEntry));
   if (selectors.length && !selectors.some(s => s.selector === '0x8da5cb5b')) out.push({ tag: 'no_owner_getter', severity: 'info', detail: 'no owner() selector', functions: [] });
-  return { size: code.length, strippedSize: stripped.length, codeHash: keccak256(code), strippedCodeHash, selectors, functions, flags: out };
+  const skeleton = skeletonHash(stripped);
+  if (sigs.skeletons[skeleton]) out.push({ tag: 'known_template', severity: 'info', detail: sigs.skeletons[skeleton], functions: [] });
+  return { size: code.length, strippedSize: stripped.length, codeHash: keccak256(code), strippedCodeHash, skeletonHash: skeleton, selectors, functions, flags: out };
 }

@@ -34,7 +34,7 @@ bytecode --file code.hex
 | `--follow-proxy` | Detect an EIP-1167 minimal proxy (embedded address) or an EIP-1967 implementation/beacon slot or the legacy OpenZeppelin (zos) slot (`eth_getStorageAt`) and scan the implementation as well. |
 | `--json` | JSON output (a result carries `incomplete: [string]` only when coverage of that same contract failed: `--follow-proxy` could not read a proxy slot, call the beacon or fetch the implementation; consumers should not treat such a result as clean) (an array when a proxy implementation or several chains are scanned). Each result has `chain`; each flag has `functions: [{selector, name}]` listing the dispatcher functions whose bounded walk reaches the flagged instruction (`{selector: null, name: "fallback/unknown"}` for the dispatcher fallthrough, empty for info flags). Text output prints `in: <function>` under each flag. |
 | `--no-listing` | Skip annotated function listings. |
-| `--signatures <file>` | Load a JSON file `{"codeHashes": {"0x<keccak of stripped code>": "label"}, "addresses": {"0x<addr>": "label"}}` merged over the shipped (empty) tables. Default: env `BYTECODE_SIGNATURES`. Invalid file: exit 2. |
+| `--signatures <file>` | Load a JSON file `{"codeHashes": {"0x<keccak of stripped code>": "label"}, "addresses": {"0x<addr>": "label"}, "skeletons": {"0x<skeletonHash>": "label"}}` merged over the shipped (empty) tables. Default: env `BYTECODE_SIGNATURES`. Invalid file: exit 2. |
 | `--fail-on high` | Exit 1 if any high-severity flag is present. |
 
 Exit codes: `0` analysed, `1` `--fail-on` tripped, `2` usage or fetch error.
@@ -54,6 +54,7 @@ Exit codes: `0` analysed, `1` `--fail-on` tripped, `2` usage or fetch error.
 | `admin_role` | info | Same guard with no `owner()`, but the write reaches none of those (for example a metadata-only role). |
 | `privileged_balance_move` | high | A non-ERC20-standard function guarded by `CALLER` == a stored value debits a balance-mapping entry for an account taken from calldata without touching the allowance mapping: the guarded role can move or burn any holder's balance. Detail adds `(survives renounceOwnership)` when `renounceOwnership()` does not clear the guarding slot. |
 | `self_liquidity` | medium | The token exposes `removeLiquidity`-style or Uniswap v4 `unlockCallback` selectors: it can manage or remove its own pool liquidity. |
+| `known_template` | info | The `skeletonHash` matches an entry in the loaded signatures file's `skeletons` table (detail = label). The shipped table is empty. |
 | `minimal_proxy` | info | EIP-1167 clone; logic lives at the embedded address. |
 | `eip1967_proxy` | info | Code references the EIP-1967 implementation/beacon slot. |
 | `no_owner_getter` | info | No `owner()` selector. |

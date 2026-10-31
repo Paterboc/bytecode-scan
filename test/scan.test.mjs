@@ -343,3 +343,26 @@ test('repro: forged metadata tail reached by a carried or computed jump target',
     assert.ok(tags(hex).includes('hardcoded_privileged_caller'), pre);
   }
 });
+
+// WHY: clones of one template differ only in immutables and metadata; the fingerprint must group them and still separate different logic.
+test('skeletonHash ignores embedded addresses and metadata but not logic', () => {
+  const mk = (addr, extra = '', tail = 'aa') => contract([['a9059cbb', '73' + addr + '5060016000' + extra + '5500']]) + 'a2' + tail.repeat(7) + '0008';
+  const base = scanBytecode(mk('11'.repeat(20)));
+  assert.match(base.skeletonHash, /^0x[0-9a-f]{64}$/);
+  assert.equal(scanBytecode(mk('22'.repeat(20), '', 'bb')).skeletonHash, base.skeletonHash);
+  assert.notEqual(scanBytecode(mk('11'.repeat(20), '54')).skeletonHash, base.skeletonHash);
+  assert.notEqual(base.skeletonHash, base.strippedCodeHash);
+});
+test('known_template from the signatures skeletons table; text mode prints the hash', () => {
+  const hex = contract([['a9059cbb', '5500']]);
+  const sk = scanBytecode(hex).skeletonHash;
+  assert.ok(!tags(hex).includes('known_template'));
+  const f = join(mkdtempSync(join(tmpdir(), 'sig-')), 'sigs.json');
+  writeFileSync(f, JSON.stringify({ skeletons: { [sk.toUpperCase().replace('0X', '0x')]: 'synthetic template' } }));
+  const j = JSON.parse(execFileSync('node', ['dist/cli.js', '--hex', hex, '--json', '--signatures', f]));
+  const k = j.flags.find(x => x.tag === 'known_template');
+  assert.equal(k.severity, 'info');
+  assert.equal(k.detail, 'synthetic template');
+  assert.equal(j.skeletonHash, sk);
+  assert.match(execFileSync('node', ['dist/cli.js', '--hex', hex, '--no-listing']).toString(), new RegExp('skeleton hash +' + sk));
+});

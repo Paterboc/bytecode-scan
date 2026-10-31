@@ -67,7 +67,7 @@ interface Target { title: string; address?: string; result: ScanResult; raw?: st
 function show(t: Target, listing: boolean): void {
   const r = t.result;
   console.log(`== ${t.title}${t.chain ? ` [${t.chain}]` : ''}: ${r.size} bytes (${r.strippedSize} without metadata)`);
-  console.log(`code hash          ${r.codeHash}\nstripped code hash ${r.strippedCodeHash}`);
+  console.log(`code hash          ${r.codeHash}\nstripped code hash ${r.strippedCodeHash}\nskeleton hash      ${r.skeletonHash}`);
   console.log(`\nselectors (${r.selectors.length}):`);
   for (const s of r.selectors) console.log(`  ${s.selector}  @0x${s.entry.toString(16).padEnd(5)} ${s.name ?? '(unknown)'}`);
   console.log('\nred flags:');
