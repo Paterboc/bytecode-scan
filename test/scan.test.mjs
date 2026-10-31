@@ -237,7 +237,7 @@ test('--follow-proxy is best-effort: junk implementation slot keeps the main res
     assert.match(a.err, /implementation unavailable/);
     const j = JSON.parse(a.out);
     assert.ok(j.flags.some(f => f.tag === 'hardcoded_privileged_caller'));
-    assert.ok(j.incomplete.some(m => /implementation unavailable/.test(m))); // hans fails closed on this field
+    assert.ok(j.incomplete.some(m => /implementation unavailable/.test(m))); // consumers fail closed on this field
     junk = false;
     assert.equal(JSON.parse((await run([])).out).incomplete, undefined); // clean run: field absent
     assert.equal((await run(['--fail-on', 'high'])).code, 1);
@@ -312,7 +312,7 @@ test('repro: PoolManager guard shared with a computed fallback route is still fl
   assert.ok(tags(hex).includes(HC));
 });
 
-// WHY: operator moves/burns any holder's balance without allowance is a confiscation capability; hans blocks on high.
+// WHY: operator moves/burns any holder's balance without allowance is a confiscation capability; a consumer can block on high.
 const mapOf = (slot) => '60' + slot + '6020' + '52'; // MSTORE(0x20, slot): mapping slot about to be hashed
 const KECC = '60205f20'; // PUSH1 0x20 PUSH0 KECCAK256
 const BAL = ['70a08231', mapOf('00') + KECC + '5400'];
@@ -329,4 +329,17 @@ test('privileged_balance_move: guarded debit of a calldata-chosen balance withou
   assert.ok(!tags(contract([BAL, ALLOW, ['11223344', GUARD6 + debit('01')]])).includes('privileged_balance_move'));
   assert.ok(!tags(contract([BAL, ALLOW, ['11223344', GUARD6 + mapOf('01') + debit('03')]])).includes('privileged_balance_move'));
   assert.ok(!tags(contract([BAL, ALLOW, ['11223344', debit('03')]])).includes('privileged_balance_move'));
+});
+
+// WHY: a jump target carried across a JUMPDEST into a forged metadata tail must not hide the guard; the caller pattern is floored over the whole code.
+test('repro: forged metadata tail reached by a carried or computed jump target', () => {
+  const g = '5b' + '73' + 'd2'.repeat(20) + '3314' + '600757' + '5f5ffd' + '5b' + '6001600755' + '00';
+  const tail = 'a1' + g, n = tail.length / 2;
+  const mk = (pre) => '0x' + pre + tail + n.toString(16).padStart(4, '0');
+  const add = '60' + '03' + '60' + '05' + '01' + '5b' + '56'; // 3+5 computed, JUMPDEST, JUMP (tail JUMPDEST sits at pc 8)
+  for (const pre of ['5f3556', '5f355b56', '5f545b56', add]) {
+    const hex = mk(pre);
+    assert.equal(scanBytecode(hex).strippedSize, pre.length / 2, pre);
+    assert.ok(tags(hex).includes('hardcoded_privileged_caller'), pre);
+  }
 });

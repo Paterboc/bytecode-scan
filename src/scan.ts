@@ -300,6 +300,7 @@ const jumpSuccessors = (flow: Flow, o: Op): number[] => [jumpTarget(flow, o.pc),
  */
 function livePcs(ops: Op[], byPc: Map<number, number>, dests: Set<number>, flow: Flow, codeEnd: number): { live: Set<number>; computed: boolean } {
   const live = new Set<number>(); const q = [0]; let computed = false, seeded = false;
+  const hasLabels = [...flow.rets.values()].some(l => l.some(d => dests.has(d)));
   for (;;) {
     while (q.length) {
       const p = q.pop()!; if (!byPc.has(p)) continue;
@@ -307,7 +308,8 @@ function livePcs(ops: Op[], byPc: Map<number, number>, dests: Set<number>, flow:
         const o = ops[i]; live.add(o.pc);
         if (o.op === 0x56 || o.op === 0x57) {
           for (const t of jumpSuccessors(flow, o)) if (dests.has(t) && !live.has(t)) q.push(t);
-          if (flow.jumps.get(o.pc) === 'C') computed = true;
+          const jv = flow.jumps.get(o.pc); // 'E' (carried) is a return jump only if some return label was pushed anywhere
+          if (jv === 'C' || (jv === 'E' && !hasLabels)) computed = true;
         }
         if (TERMINATORS.has(o.name)) break;
       }
@@ -414,7 +416,7 @@ interface Raised { flag: Flag; sites: number[]; anyLive: boolean; allLive: boole
  * HIGH-severity detectors run on a LINEAR floor: every op of the code region (before the metadata tail) plus any metadata-region op proven reachable.
  * Reachability only attributes functions and gates exemptions; it never decides whether a HIGH flag fires.
  */
-function detectFlags(ops: Op[], stripped: Buffer, strippedHash: string, live: Set<number>): Raised[] {
+function detectFlags(ops: Op[], byPc: Map<number, number>, stripped: Buffer, strippedHash: string, live: Set<number>): Raised[] {
   const flags: Raised[] = [];
   const add = (tag: string, severity: 'high' | 'medium' | 'info', detail: string, sites: number[] = []): void => {
     const anyLive = sites.some(p => live.has(p));
@@ -423,11 +425,11 @@ function detectFlags(ops: Op[], stripped: Buffer, strippedHash: string, live: Se
   const floor = ops.filter(o => o.pc < stripped.length || live.has(o.pc));
   const names = new Set(floor.map(o => o.name));
   const addrs = new Map<string, number[]>(); const privileged = new Map<string, number[]>();
-  floor.forEach((o) => {
+  ops.forEach((o) => { // address patterns: floored over the FULL code, tail included
     const a = addrConst(o);
     if (!a) return;
     addrs.set(a, [...(addrs.get(a) ?? []), o.pc]);
-    const i = ops.indexOf(o), w = ops.slice(Math.max(0, i - 6), i + 7);
+    const i = byPc.get(o.pc)!, w = ops.slice(Math.max(0, i - 6), i + 7);
     // address const vs CALLER/ORIGIN through EQ (or SUB/XOR + ISZERO), either operand order, DUP/SWAP between
     if (w.some(x => x.name === 'CALLER' || x.name === 'ORIGIN') && hasCmp(new Set(w.map(x => x.name)))) privileged.set(a, [...(privileged.get(a) ?? []), o.pc, ...w.filter(x => x.name === 'CALLER' || x.name === 'ORIGIN').map(x => x.pc)]);
   });
@@ -455,7 +457,7 @@ export function scanBytecode(hex: string): ScanResult {
   const walks = selectors.map(s => ({ ...s, ...listFunction(ops, byPc, dests, s.entry, code) }));
   const functions = walks.map(({ pcs: _p, ...f }) => f);
   const fbEntry = selectors.length ? fallbackEntry(ops) : null;
-  const flags = detectFlags(ops, stripped, strippedCodeHash, live);
+  const flags = detectFlags(ops, byPc, stripped, strippedCodeHash, live);
   const fb = fbEntry !== null && flags.some(f => f.sites.length) ? listFunction(ops, byPc, dests, fbEntry, code).pcs : new Set<number>();
   for (const f of flags) {
     f.flag.functions = walks.filter(w => f.sites.some(p => w.pcs.has(p))).map(w => ({ selector: w.selector, name: w.name }));
