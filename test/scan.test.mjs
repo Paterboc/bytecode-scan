@@ -379,3 +379,10 @@ test('selector flood at 96 KB is bounded and flagged analysis_budget_exceeded, w
   assert.ok(r.flags.some(x => x.tag === 'hardcoded_privileged_caller'));
   assert.ok(!tags(contract([['a9059cbb', '00']])).includes('analysis_budget_exceeded')); // ordinary code never trips it
 });
+
+test('DUP1 ADD chain does not blow up memory (slot-source lists are deduped and capped)', () => {
+  // each DUP1 ADD used to concatenate the value's slot list with itself: 2^28 entries, about 4 GB, then OOM
+  const t = Date.now();
+  scanBytecode('0x600154' + '8001'.repeat(28));
+  assert.ok(Date.now() - t < 2000);
+});

@@ -325,7 +325,7 @@ function simulate(ops: Op[]): Flow {
     if (b >= 0xa0 && b <= 0xa4) { for (let k = 0; k < 2 + b - 0xa0; k++) pop(); continue; }
     const [p, q] = EFFECT.get(b) ?? [0, 0];
     const args = Array.from({ length: p }, pop);
-    const src = args.flatMap(a => a.src ?? []);
+    const src = [...new Set(args.flatMap(a => a.src ?? []))].slice(0, 8); // dedupe+cap: DUP1 ADD chains would double it per op (OOM on a 60-byte input)
     if ((b === 0x14 || b === 0x03 || b === 0x18) && args.length === 2) for (const [x, y] of [[args[0], args[1]], [args[1], args[0]]]) if (x.caller && y.src?.length) guards.set(o.pc, y.src);
     const f = b in FOLD ? FOLD[b] : undefined;
     for (let k = 0; k < q; k++) {
