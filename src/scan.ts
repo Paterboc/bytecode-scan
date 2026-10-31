@@ -19,7 +19,7 @@ const keccakId = (s: string): string => keccak256(Buffer.from(s, 'utf8'));
 export interface Op { pc: number; op: number; name: string; data?: string }
 export interface Selector { selector: string; name: string | null; entry: number }
 export interface FlagFunction { selector: string | null; name: string | null }
-export interface Flag { tag: string; severity: 'high' | 'info'; detail: string; functions: FlagFunction[] }
+export interface Flag { tag: string; severity: 'high' | 'medium' | 'info'; detail: string; functions: FlagFunction[] }
 export interface FuncListing { selector: string; name: string | null; entry: number; lines: string[] }
 export interface ScanResult {
   size: number; strippedSize: number; codeHash: string; strippedCodeHash: string;
@@ -48,6 +48,9 @@ export const FLAG_EXPLAIN: Record<string, string> = {
   known_scam_address: 'A PUSH20 constant matches an entry in the loaded signatures file.',
   minimal_proxy: 'EIP-1167 minimal proxy: real logic lives at the embedded address (use --follow-proxy).',
   eip1967_proxy: 'References the EIP-1967 implementation or beacon storage slot: upgradeable proxy, real logic lives in another contract (use --follow-proxy).',
+  owner_switch: 'owner() exists and a non-standard function guarded by a CALLER check writes a constant storage slot that transfer/transferFrom read: the owner can flip a setting transfers depend on (sell lock, trading switch, limits, blacklist toggle).',
+  hidden_admin: 'No owner() getter, yet a non-standard function is guarded by CALLER == a stored constant-slot value and writes state: an admin role with no public getter.',
+  self_liquidity: 'The token itself exposes removeLiquidity-style or Uniswap v4 unlockCallback selectors: it can manage or remove its own pool liquidity.',
   no_owner_getter: 'Info: no owner() selector; owner-based probes are not applicable.',
 };
 
@@ -220,14 +223,77 @@ function fallthroughPcs(ops: Op[], byPc: Map<number, number>, dests: Set<number>
   return new Set();
 }
 
+// ---- reachability and per-function facts ----
+/** Pcs of ops reachable from pc 0 via fallthrough and PUSH-ed JUMPDEST targets; the rest is data/string tail. */
+function livePcs(ops: Op[], byPc: Map<number, number>, dests: Set<number>): Set<number> {
+  const live = new Set<number>(); const q = [0];
+  while (q.length) {
+    const p = q.pop()!; if (!byPc.has(p)) continue;
+    for (let i = byPc.get(p)!; i < ops.length && !live.has(ops[i].pc); i++) {
+      const o = ops[i]; live.add(o.pc);
+      if (o.data && o.data.length <= 16) { const v = parseInt(o.data, 16); if (dests.has(v) && !live.has(v)) q.push(v); }
+      if (TERMINATORS.has(o.name)) break;
+    }
+  }
+  return live;
+}
+/** >= 75% printable ASCII bytes: a string literal that happens to be PUSH20-sized, not an address. */
+const looksAscii = (hex: string): boolean => Buffer.from(hex, 'hex').filter(c => c >= 0x20 && c < 0x7f).length * 4 >= hex.length / 2 * 3;
+
+/** Op names, constant slots read (PUSHn slot SLOAD) and written (small PUSH within 14 ops before SSTORE) on the walk from `entry`. */
+function reachFacts(ops: Op[], byPc: Map<number, number>, dests: Set<number>, entry: number): { names: Set<string>; rd: Set<number>; wr: Set<number> } {
+  // ponytail: heuristic slot detection (constants <= 0x40 near SSTORE), not symbolic; capped at 4000 ops. Upgrade path: stack tracking.
+  const names = new Set<string>(), rd = new Set<number>(), wr = new Set<number>(), seen = new Set<number>(); const q = [entry]; let n = 0;
+  while (q.length && n < 4000) {
+    const p = q.pop()!; if (seen.has(p) || !byPc.has(p)) continue;
+    seen.add(p);
+    for (let i = byPc.get(p)!; i < ops.length; n++) {
+      const o = ops[i];
+      if (o.data && o.data.length <= 16) { const v = parseInt(o.data, 16); if (dests.has(v) && !seen.has(v)) q.push(v); }
+      names.add(o.name);
+      const pv = ops[i - 1];
+      if (o.name === 'SLOAD' && pv && (pv.name === 'PUSH1' || pv.name === 'PUSH2')) rd.add(parseInt(pv.data!, 16));
+      if (o.name === 'SSTORE') for (const x of ops.slice(Math.max(0, i - 14), i).reverse().filter((y, k, w) => !w.slice(0, k).some(z => z.name === 'JUMPDEST' || TERMINATORS.has(z.name)))) if ((x.name === 'PUSH1' || x.name === 'PUSH2') && parseInt(x.data!, 16) <= 0x40 && !['00', '01', '20', '40', 'ff'].includes(x.data!)) wr.add(parseInt(x.data!, 16));
+      if (TERMINATORS.has(o.name)) break;
+      i++;
+      if (ops[i]?.name === 'JUMPDEST') { if (seen.has(ops[i].pc)) break; seen.add(ops[i].pc); }
+    }
+  }
+  return { names, rd, wr };
+}
+
+const STD_SELS = new Set([...'name() symbol() decimals() totalSupply() balanceOf(address) transfer(address,uint256) transferFrom(address,address,uint256) approve(address,uint256) allowance(address,address) increaseAllowance(address,uint256) decreaseAllowance(address,uint256) owner() renounceOwnership() transferOwnership(address) permit(address,address,uint256,uint256,uint8,bytes32,bytes32) nonces(address) DOMAIN_SEPARATOR() eip712Domain()'.split(' ')].map(s => keccakId(s).slice(0, 10)));
+const SEL_OWNER = '0x8da5cb5b', SEL_TRANSFER = '0xa9059cbb', SEL_TRANSFER_FROM = '0x23b872dd', SEL_UNLOCK_CALLBACK = '0x91dd7346';
+// removeLiquidity(), removeLiquidity(address,uint256), unlockCallback(bytes)
+const SELF_LIQ_SELS = new Set(['0x67b9a286', '0xa201ccf6', SEL_UNLOCK_CALLBACK]);
+
+function behaviourFlags(ops: Op[], byPc: Map<number, number>, dests: Set<number>, selectors: Selector[], privilegedSels: Set<string | null>): Flag[] {
+  const out: Flag[] = []; const fn = (s: Selector): FlagFunction => ({ selector: s.selector, name: s.name });
+  const hasOwner = selectors.some(s => s.selector === SEL_OWNER);
+  const facts = new Map(selectors.map(s => [s.selector, reachFacts(ops, byPc, dests, s.entry)]));
+  const nonstd = selectors.filter(s => !STD_SELS.has(s.selector));
+  const xr = new Set<number>(); for (const t of [SEL_TRANSFER, SEL_TRANSFER_FROM]) for (const r of facts.get(t)?.rd ?? []) xr.add(r);
+  if (hasOwner) {
+    const hits = nonstd.map(s => ({ s, f: facts.get(s.selector)!, slots: [...facts.get(s.selector)!.wr].filter(w => xr.has(w)) }))
+      .filter(h => h.f.names.has('CALLER') && h.f.names.has('SLOAD') && h.f.names.has('EQ') && h.f.wr.size > 0 && h.f.wr.size <= 3 && h.slots.length);
+    if (hits.length) out.push({ tag: 'owner_switch', severity: 'medium', detail: `slot ${[...new Set(hits.flatMap(h => h.slots))].sort((a, b) => a - b).join(', ')} written by a CALLER-guarded function and read by transfer`, functions: hits.map(h => fn(h.s)) });
+  } else {
+    const hits = nonstd.filter(s => { const n = facts.get(s.selector)!.names; return ['CALLER', 'SLOAD', 'EQ', 'SSTORE'].every(x => n.has(x)) && !n.has('KECCAK256') && !privilegedSels.has(s.selector); });
+    if (hits.length) out.push({ tag: 'hidden_admin', severity: 'medium', detail: 'CALLER-guarded state write with no owner() getter', functions: hits.map(fn) });
+  }
+  const liq = selectors.filter(s => SELF_LIQ_SELS.has(s.selector));
+  if (liq.length) out.push({ tag: 'self_liquidity', severity: 'medium', detail: liq.map(s => s.name ?? s.selector).join(', '), functions: liq.map(fn) });
+  return out;
+}
+
 // ---- flags ----
-function detectFlags(ops: Op[], stripped: Buffer, strippedHash: string): { flag: Flag; sites: number[] }[] {
+function detectFlags(ops: Op[], stripped: Buffer, strippedHash: string, live: Set<number>): { flag: Flag; sites: number[] }[] {
   const flags: { flag: Flag; sites: number[] }[] = [];
-  const add = (tag: string, severity: 'high' | 'info', detail: string, sites: number[] = []): void => { flags.push({ flag: { tag, severity, detail, functions: [] }, sites }); };
+  const add = (tag: string, severity: 'high' | 'medium' | 'info', detail: string, sites: number[] = []): void => { flags.push({ flag: { tag, severity, detail, functions: [] }, sites }); };
   const names = new Set(ops.map(o => o.name));
   const addrs = new Map<string, number[]>(); const privileged = new Map<string, number[]>();
   ops.forEach((o, i) => {
-    if (o.name !== 'PUSH20' || /^f+$/.test(o.data!)) return;
+    if (o.name !== 'PUSH20' || /^f+$/.test(o.data!) || !live.has(o.pc) || looksAscii(o.data!)) return; // data/string tails decode as fake PUSH20s
     const a = '0x' + o.data!; addrs.set(a, [...(addrs.get(a) ?? []), o.pc]);
     const w = ops.slice(Math.max(0, i - 6), i + 7);
     // PUSH20 const vs CALLER/ORIGIN through EQ, either operand order, DUP/SWAP between
@@ -253,7 +319,7 @@ export function scanBytecode(hex: string): ScanResult {
   const selectors = extractSelectors(ops);
   const walks = selectors.map(s => ({ ...s, ...listFunction(ops, byPc, dests, s.entry, stripped) }));
   const functions = walks.map(({ pcs: _p, ...f }) => f);
-  const flags = detectFlags(ops, stripped, strippedCodeHash).map(({ flag, sites }) => {
+  const flags = detectFlags(ops, stripped, strippedCodeHash, livePcs(ops, byPc, dests)).map(({ flag, sites }) => {
     flag.functions = walks.filter(w => sites.some(p => w.pcs.has(p))).map(w => ({ selector: w.selector, name: w.name }));
     return { flag, sites };
   });
@@ -261,7 +327,10 @@ export function scanBytecode(hex: string): ScanResult {
     const fb = fallthroughPcs(ops, byPc, dests, stripped);
     for (const f of flags) if (f.sites.length && !f.flag.functions.length && f.sites.some(p => fb.has(p))) f.flag.functions = [{ selector: null, name: 'fallback/unknown' }];
   }
-  const out = flags.map(f => f.flag);
+  // Uniswap v4 unlockCallback must check msg.sender == PoolManager: legitimate, not a hidden role
+  const kept = flags.filter(f => !(f.flag.tag === 'hardcoded_privileged_caller' && f.flag.functions.length && f.flag.functions.every(x => x.selector === SEL_UNLOCK_CALLBACK)));
+  const privileged = new Set(kept.filter(f => f.flag.tag === 'hardcoded_privileged_caller').flatMap(f => f.flag.functions.map(x => x.selector)));
+  const out = kept.map(f => f.flag).concat(behaviourFlags(ops, byPc, dests, selectors, privileged));
   if (selectors.length && !selectors.some(s => s.selector === '0x8da5cb5b')) out.push({ tag: 'no_owner_getter', severity: 'info', detail: 'no owner() selector', functions: [] });
   return { size: code.length, strippedSize: stripped.length, codeHash: keccak256(code), strippedCodeHash, selectors, functions, flags: out };
 }

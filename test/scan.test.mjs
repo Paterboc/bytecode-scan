@@ -100,6 +100,58 @@ test('fallthrough-only site is attributed to fallback/unknown', () => {
   assert.deepEqual(r.flags.find(x => x.tag === 'selfdestruct').functions, [{ selector: null, name: 'fallback/unknown' }]);
 });
 
+// ---- behavioural flags (synthetic dispatcher: n x [PUSH4 sel EQ PUSH2 off JUMPI], STOP, bodies each starting JUMPDEST) ----
+const contract = (fns) => {
+  let off = fns.length * 10 + 1;
+  const heads = fns.map(([s, b]) => { const h = '63' + s + '14' + '61' + off.toString(16).padStart(4, '0') + '57'; off += 1 + b.length / 2; return h; });
+  return '0x' + heads.join('') + '00' + fns.map(([, b]) => '5b' + b).join('');
+};
+const OWNER = ['8da5cb5b', '00'];
+const readsSlot = (n) => '60' + n + '5400'; // PUSH1 n SLOAD STOP
+const SETTER = ['11223344', '33' + '600154' + '14' + '6001' + '6005' + '55' + '00']; // CALLER == SLOAD(1); SSTORE slot 5
+const find = (hex, tag) => scanBytecode(hex).flags.find(f => f.tag === tag);
+
+// WHY: an owner who can flip a slot that transfer reads can lock sells; a setter of an unrelated slot cannot.
+test('owner_switch: guarded setter of a slot transfer reads', () => {
+  const f = find(contract([OWNER, ['a9059cbb', readsSlot('05')], SETTER]), 'owner_switch');
+  assert.equal(f.severity, 'medium');
+  assert.match(f.detail, /slot 5/);
+  assert.deepEqual(f.functions, [{ selector: '0x11223344', name: null }]);
+});
+test('owner_switch: not raised when transfer does not read the setter slot, or without owner()', () => {
+  assert.ok(!tags(contract([OWNER, ['a9059cbb', readsSlot('06')], SETTER])).includes('owner_switch'));
+  assert.ok(!tags(contract([['a9059cbb', readsSlot('05')], SETTER])).includes('owner_switch'));
+});
+
+// WHY: an admin role with no owner() getter is invisible to owner probes.
+test('hidden_admin: CALLER-guarded state write without owner()', () => {
+  const f = find(contract([['a9059cbb', readsSlot('06')], SETTER]), 'hidden_admin');
+  assert.equal(f.severity, 'medium');
+  assert.deepEqual(f.functions, [{ selector: '0x11223344', name: null }]);
+  assert.ok(!tags(contract([OWNER, ['a9059cbb', readsSlot('06')], SETTER])).includes('hidden_admin'));
+});
+
+test('self_liquidity: removeLiquidity and unlockCallback selectors', () => {
+  const f = find(contract([['67b9a286', '00'], ['91dd7346', '00']]), 'self_liquidity');
+  assert.equal(f.severity, 'medium');
+  assert.deepEqual(f.functions.map(x => x.selector), ['0x67b9a286', '0x91dd7346']);
+});
+
+// WHY: Uniswap v4 requires unlockCallback to check msg.sender == PoolManager; that is not a hidden role.
+test('hardcoded caller inside unlockCallback only is suppressed', () => {
+  const guard = '73' + ADDR + '331450' + '00';
+  assert.ok(!tags(contract([['91dd7346', guard]])).includes('hardcoded_privileged_caller'));
+  assert.ok(tags(contract([['91dd7346', guard], ['11223344', guard]])).includes('hardcoded_privileged_caller'));
+  assert.ok(tags(contract([['11223344', guard]])).includes('hardcoded_privileged_caller'));
+});
+
+// WHY: string/data tails decode as fake PUSH20 constants.
+test('PUSH20 in an ASCII string or unreachable tail is not an address', () => {
+  const text = Buffer.from('insufficient balance.').subarray(0, 20).toString('hex');
+  assert.ok(!tags('0x73' + text + '331400').includes('hardcoded_privileged_caller')); // reachable but ASCII
+  assert.ok(!tags('0x00' + '73' + ADDR + '331400').includes('hardcoded_privileged_caller')); // after STOP, unreachable
+});
+
 // ---- auto chain ----
 const { autoDetect } = require('../dist/auto.js');
 const CH = { a: 'ua', b: 'ub', c: 'uc' };

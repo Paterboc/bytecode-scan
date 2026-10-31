@@ -43,15 +43,20 @@ Exit codes: `0` analysed, `1` `--fail-on` tripped, `2` usage or fetch error.
 
 | Tag | Severity | Meaning |
 | --- | --- | --- |
-| `hardcoded_privileged_caller` | high | A fixed address constant is compared with `msg.sender`/`tx.origin`: a compile-time privileged role that `owner()`-style checks cannot see. |
+| `hardcoded_privileged_caller` | high | A fixed address constant (in reachable code, not ASCII text) is compared with `msg.sender`/`tx.origin`: a compile-time privileged role that `owner()`-style checks cannot see. Not raised when the only function reaching it is Uniswap v4 `unlockCallback(bytes)`, which must check the PoolManager. |
 | `selfdestruct` | high | Contains `SELFDESTRUCT`. |
 | `delegatecall` | high | Contains `DELEGATECALL` (foreign code in this contract's storage). |
 | `callcode` | high | Contains deprecated `CALLCODE`. |
 | `known_scam_codehash` | high | Metadata-stripped code hash matches an entry in the loaded signatures file. |
 | `known_scam_address` | high | A `PUSH20` constant matches an entry in the loaded signatures file. |
+| `owner_switch` | medium | Has `owner()`, and a non-standard function guarded by a `CALLER` check writes a constant storage slot that `transfer`/`transferFrom` read: the owner can flip a setting transfers depend on (sell lock, trading switch, limits, blacklist toggle). `functions` lists the setters; `detail` names the slot. |
+| `hidden_admin` | medium | No `owner()`, yet a non-standard function is guarded by `CALLER` == a stored constant-slot value and writes state. |
+| `self_liquidity` | medium | The token exposes `removeLiquidity`-style or Uniswap v4 `unlockCallback` selectors: it can manage or remove its own pool liquidity. |
 | `minimal_proxy` | info | EIP-1167 clone; logic lives at the embedded address. |
 | `eip1967_proxy` | info | Code references the EIP-1967 implementation/beacon slot. |
 | `no_owner_getter` | info | No `owner()` selector. |
+
+Severities are `high`, `medium` and `info`; `medium` flags are heuristics (leads to review). `--fail-on high` ignores them.
 
 `delegatecall` and `selfdestruct` are legitimate in many contracts (proxies, factories); treat flags as leads, not verdicts.
 
