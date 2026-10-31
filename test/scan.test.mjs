@@ -470,3 +470,25 @@ test('narrow-pushed address (leading zero bytes) is a caller constant', () => {
   assert.ok(tags('0x6b' + 'a1'.repeat(12) + '33' + '14' + '00').includes(HC)); // PUSH12 CALLER EQ
   assert.ok(!tags('0x6b' + '00'.repeat(11) + '01' + '33' + '14' + '00').includes(HC)); // a small number is not an address
 });
+
+// ---- solc-compiled synthetic contracts (generic ERC20-like, placeholder addresses): the codegen shapes real tokens use ----
+import { readFileSync } from 'node:fs';
+const FX = JSON.parse(readFileSync(new URL('./compiled-fixtures.json', import.meta.url), 'utf8'));
+// WHY: caller taint crosses blocks (msg.sender helpers, modifiers, branches) and compares come as NOT/ADD, SUB, range or shifted forms; none may hide the constant.
+for (const k of ['v_msgSender.unopt', 'v_modifier.unopt', 'v_helper.unopt', 'v_vanityMs.unopt', 'v_localBranch.unopt', 'v_localBranch.opt', 'earlyret.opt', 'v_range.opt', 'v_bytes20.ir']) {
+  test('compiled caller check is flagged: ' + k, () => {
+    const f = scanBytecode('0x' + FX[k]).flags.find(x => x.tag === HC);
+    assert.ok(f, k);
+    assert.match(f.detail, /^0x(7{40}|0{8}7{32})$/, 'reports the constant actually compared'); // placeholder dev / vanity
+  });
+}
+// WHY: the operator seizing any holder's balance must be flagged however the code was compiled, including an allowance READ and unchecked arithmetic.
+for (const k of ['pbm.unopt', 'pbm.opt', 'pbm.ir', 'pbm_allowread.opt', 'pbm_unchecked_direct.opt']) {
+  test('compiled balance seizure is flagged: ' + k, () => {
+    assert.equal(scanBytecode('0x' + FX[k]).flags.find(x => x.tag === 'privileged_balance_move')?.severity, 'high', k);
+  });
+}
+test('compiled clean token raises neither', () => {
+  const t = scanBytecode('0x' + FX['clean.opt']).flags.map(x => x.tag);
+  assert.ok(!t.includes(HC) && !t.includes('privileged_balance_move'));
+});
