@@ -386,3 +386,19 @@ test('DUP1 ADD chain does not blow up memory (slot-source lists are deduped and 
   scanBytecode('0x600154' + '8001'.repeat(28));
   assert.ok(Date.now() - t < 2000);
 });
+
+// WHY: every visited CODECOPY used to append its whole printable source range to the revert string (256 selectors x many CODECOPYs -> OOM at ~24 KB).
+test('CODECOPY string flood is bounded in time and listing size', () => {
+  const nsel = 256, tailLen = 8000, entry = nsel * 10 + 1;
+  const k = Math.floor((24000 - entry - 2 - tailLen) / 9), tailOff = entry + 1 + 9 * k + 1;
+  const h2 = (n) => n.toString(16).padStart(4, '0');
+  let hex = '';
+  for (let i = 0; i < nsel; i++) hex += '63' + (0x10000000 + i).toString(16).padStart(8, '0') + '14' + '61' + h2(entry) + '57';
+  hex += '00' + '5b';
+  for (let i = 0; i < k; i++) hex += '61' + h2(tailLen) + '61' + h2(tailOff) + '6000' + '39';
+  hex += 'fd' + Buffer.from('A'.repeat(tailLen)).toString('hex');
+  const t0 = Date.now(), r = scanBytecode('0x' + hex);
+  assert.ok(Date.now() - t0 < 3000, 'took ' + (Date.now() - t0) + ' ms');
+  assert.ok(JSON.stringify(r.functions).length < 8_000_000);
+  assert.ok(r.functions.every(f => f.lines.every(l => l.length < 1400)));
+});

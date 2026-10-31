@@ -156,26 +156,30 @@ function wordString(hex: string): string | null {
  * When exceeded the walks stop and scanBytecode emits `analysis_budget_exceeded`; the O(n) linear-floor HIGH checks still run.
  */
 const MAX_WORK_OPS = 1_000_000, MAX_SELECTORS = 1000;
-const budget = { left: MAX_WORK_OPS, exceeded: false };
+const MAX_BYTES = 4_000_000, MAX_STR = 1024, MAX_COPY = 256, MAX_QUEUE = 512; // listing/string bytes per scan, chars per revert string, bytes read per CODECOPY, pending blocks per walk
+const budget = { left: MAX_WORK_OPS, bytes: MAX_BYTES, exceeded: false };
 const spend = (): boolean => { if (budget.left-- <= 0) budget.exceeded = true; return !budget.exceeded; };
+/** Charge `n` bytes of produced text (listing lines, revert strings) against the global byte budget. */
+const spendBytes = (n: number): boolean => { budget.bytes -= n; if (budget.bytes < 0) budget.exceeded = true; return !budget.exceeded; };
 
 function listFunction(ops: Op[], byPc: Map<number, number>, dests: Set<number>, entry: number, code: Buffer): { lines: string[]; pcs: Set<number> } {
   const lines: string[] = []; const pcs = new Set<number>(); // pcs: every op the bounded walk visited (flag attribution)
   const queue = [entry]; const seen = new Set<number>();
   const MAX_BLOCKS = 80, MAX_LINES = 120;
-  let strWords: string[] = []; let cond: string | null = null; // function-scoped: revert strings are built in shared helper blocks
+  let strWords: string[] = [], strLen = 0; let cond: string | null = null; // function-scoped: revert strings are built in shared helper blocks
   while (queue.length && seen.size < MAX_BLOCKS && lines.length < MAX_LINES && !budget.exceeded) {
     const start = queue.shift()!;
     if (seen.has(start) || (start !== entry && !dests.has(start)) || !byPc.has(start)) continue;
     seen.add(start);
     let labelled = false;
-    const push = (l: string): void => { if (!labelled) { lines.push(`@0x${start.toString(16)}:`); labelled = true; } lines.push('  ' + l); };
+    const push = (l: string): void => { if (lines.length >= MAX_LINES * 2 || !spendBytes(l.length + 24)) return; if (!labelled) { lines.push(`@0x${start.toString(16)}:`); labelled = true; } lines.push('  ' + l); };
+    const word = (w: string): void => { if (strLen < MAX_STR && spendBytes(w.length)) { strWords.push(w); strLen += w.length; } }; // revert-string pieces: <= MAX_STR chars per string
     for (let i = byPc.get(start)!; i < ops.length; i++) {
       if (!spend()) break;
       const o = ops[i]; const prev = ops[i - 1]; pcs.add(o.pc);
       const prevData = prev?.data !== undefined ? prev.data.replace(/^0+(?=.)/, '') : '';
       let line: string | null = null;
-      if (o.name === 'PUSH32') { const s = wordString(o.data!); if (s) strWords.push(s); }
+      if (o.name === 'PUSH32') { const s = wordString(o.data!); if (s) word(s); }
       switch (o.name) {
         case 'CALLER': case 'ORIGIN': {
           const k = ops.slice(i + 1, i + 6); const eq = k.findIndex(x => x.name === 'EQ');
@@ -183,7 +187,7 @@ function listFunction(ops: Op[], byPc: Map<number, number>, dests: Set<number>, 
           if (c) cond = `${o.name} == 0x${c.data}${sigs.addresses['0x' + c.data] ? ' [' + sigs.addresses['0x' + c.data] + ']' : ''}`; else line = o.name;
           break;
         }
-        case 'JUMPI': { const d = isPush(prev) ? parseInt(prev.data!, 16) : null; const c = cond ?? '...'; cond = null; line = `if (${prev?.name === 'PUSH2' && ops[i - 2]?.name === 'ISZERO' ? `!(${c})` : c}) goto ${d === null ? '?' : '@0x' + d.toString(16)}`; if (d !== null) queue.push(d); break; }
+        case 'JUMPI': { const d = isPush(prev) ? parseInt(prev.data!, 16) : null; const c = cond ?? '...'; cond = null; line = `if (${prev?.name === 'PUSH2' && ops[i - 2]?.name === 'ISZERO' ? `!(${c})` : c}) goto ${d === null ? '?' : '@0x' + d.toString(16)}`; if (d !== null && queue.length < MAX_QUEUE) queue.push(d); break; }
         case 'SLOAD': case 'SSTORE': line = isPush(prev) ? `${o.name} slot ${parseInt(prevData, 16)}` : `${o.name} slot ?`; break;
         case 'KECCAK256': line = 'KECCAK256 (mapping/array slot)'; break;
         case 'CALL': case 'STATICCALL': case 'DELEGATECALL': case 'CALLCODE': case 'SELFDESTRUCT': case 'CREATE': case 'CREATE2': line = o.name; break;
@@ -193,10 +197,10 @@ function listFunction(ops: Op[], byPc: Map<number, number>, dests: Set<number>, 
         }
         case 'CODECOPY': { // PUSH len, PUSH off, PUSH dest, CODECOPY
           const [l, f] = [ops[i - 3], ops[i - 2]];
-          if (isPush(l) && isPush(f)) { const off = parseInt(f.data!, 16), len = parseInt(l.data!, 16); const s = code.subarray(off, off + len); if (printable(s)) strWords.push(s.toString('latin1')); }
+          if (isPush(l) && isPush(f)) { const off = parseInt(f.data!, 16), len = parseInt(l.data!, 16); const s = code.subarray(off, off + Math.min(len, MAX_COPY)); if (printable(s)) word(s.toString('latin1')); }
           break;
         }
-        case 'REVERT': line = strWords.length ? `revert("${strWords.join('')}")` : 'REVERT'; strWords = []; break;
+        case 'REVERT': line = strWords.length ? `revert("${strWords.join('')}")` : 'REVERT'; strWords = []; strLen = 0; break;
         case 'RETURN': case 'STOP': case 'INVALID': line = o.name; break;
         case 'EQ': if (isPush(prev) && prev.name === 'PUSH20' && !/^f+$/.test(prev.data!)) line = `EQ 0x${prev.data}`; break;
         default: break;
@@ -204,13 +208,13 @@ function listFunction(ops: Op[], byPc: Map<number, number>, dests: Set<number>, 
       if (line) push(line);
       if (o.name === 'JUMP') {
         const d = isPush(prev) ? parseInt(prev.data!, 16) : null;
-        if (d !== null) queue.unshift(d);
+        if (d !== null && queue.length < MAX_QUEUE) queue.unshift(d);
         // ponytail: internal-call return label (PUSH ret, ..., PUSH fn, JUMP) is queued too; no stack tracking
         const ret = ops.slice(Math.max(0, i - 6), i - 1).reverse().find(x => x.name === 'PUSH2' && dests.has(parseInt(x.data!, 16)));
-        if (ret) queue.push(parseInt(ret.data!, 16));
+        if (ret && queue.length < MAX_QUEUE) queue.push(parseInt(ret.data!, 16));
       }
       if (TERMINATORS.has(o.name)) break;
-      if (o.name === 'JUMPDEST' && o.pc !== start && lines.length > 1 && !strWords.length) { queue.push(o.pc); break; } // fell into next block
+      if (o.name === 'JUMPDEST' && o.pc !== start && lines.length > 1 && !strWords.length) { if (queue.length < MAX_QUEUE) queue.push(o.pc); break; } // fell into next block
     }
   }
   return { lines, pcs };
@@ -379,7 +383,7 @@ function reachFacts(ops: Op[], byPc: Map<number, number>, dests: Set<number>, fl
     for (let i = byPc.get(p)!; i < ops.length; n++) {
       if (!spend()) break;
       const o = ops[i];
-      if (o.op === 0x56 || o.op === 0x57) for (const t of jumpSuccessors(flow, o)) if (dests.has(t) && !seen.has(t)) q.push(t);
+      if (o.op === 0x56 || o.op === 0x57) for (const t of jumpSuccessors(flow, o)) if (dests.has(t) && !seen.has(t) && spend()) q.push(t); // each queued target is charged to the work budget
       names.add(o.name);
       const pv = ops[i - 1], k = flow.keys.get(o.pc);
       if (o.name === 'SLOAD') { if (k !== undefined) rd.add(k); else if (pv && (pv.name === 'PUSH1' || pv.name === 'PUSH2')) rd.add(BigInt('0x' + pv.data!)); }
@@ -483,7 +487,8 @@ function detectFlags(ops: Op[], byPc: Map<number, number>, stripped: Buffer, str
     // address const vs CALLER/ORIGIN through EQ (or SUB/XOR + ISZERO), either operand order, DUP/SWAP between
     if (w.some(x => x.name === 'CALLER' || x.name === 'ORIGIN') && hasCmp(new Set(w.map(x => x.name)))) privileged.set(a, [...(privileged.get(a) ?? []), o.pc, ...w.filter(x => x.name === 'CALLER' || x.name === 'ORIGIN').map(x => x.pc)]);
   });
-  for (const [a, sites] of privileged) add('hardcoded_privileged_caller', 'high', a, sites);
+  let nPriv = 0; // bound: attribution costs walks x sites per flag, so report at most 64 distinct addresses (already a maximal red flag)
+  for (const [a, sites] of privileged) if (nPriv++ < 64) add('hardcoded_privileged_caller', 'high', a, sites);
   for (const [n, t] of [['SELFDESTRUCT', 'selfdestruct'], ['DELEGATECALL', 'delegatecall'], ['CALLCODE', 'callcode']] as const) if (names.has(n)) add(t, 'high', n, floor.filter(o => o.name === n).map(o => o.pc));
   if (sigs.codeHashes[strippedHash]) add('known_scam_codehash', 'high', sigs.codeHashes[strippedHash]);
   for (const [a, sites] of addrs) if (sigs.addresses[a]) add('known_scam_address', 'high', `${a} ${sigs.addresses[a]}`, sites);
@@ -503,7 +508,7 @@ export function scanBytecode(hex: string): ScanResult {
   const dests = new Set(ops.filter(o => o.name === 'JUMPDEST').map(o => o.pc));
   const flow = simulate(ops);
   const { live, computed } = livePcs(ops, byPc, dests, flow, code.length);
-  budget.left = MAX_WORK_OPS; budget.exceeded = false;
+  budget.left = MAX_WORK_OPS; budget.bytes = MAX_BYTES; budget.exceeded = false;
   let selectors = extractSelectors(ops);
   if (selectors.length > MAX_SELECTORS) { selectors = selectors.slice(0, MAX_SELECTORS); budget.exceeded = true; }
   const walks = selectors.map(s => ({ ...s, ...listFunction(ops, byPc, dests, s.entry, code) }));
