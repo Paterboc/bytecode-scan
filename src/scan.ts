@@ -413,7 +413,8 @@ function addrConst(o: Op): string | null {
 
 interface Raised { flag: Flag; sites: number[]; anyLive: boolean; allLive: boolean }
 /**
- * HIGH-severity detectors run on a LINEAR floor: every op of the code region (before the metadata tail) plus any metadata-region op proven reachable.
+ * HIGH-severity detectors run on a LINEAR floor: address-constant patterns (caller check, known addresses) over the FULL code including any tail;
+ * opcode flags (SELFDESTRUCT/DELEGATECALL/CALLCODE) over the code region (before the metadata tail) plus any tail op proven reachable.
  * Reachability only attributes functions and gates exemptions; it never decides whether a HIGH flag fires.
  */
 function detectFlags(ops: Op[], byPc: Map<number, number>, stripped: Buffer, strippedHash: string, live: Set<number>): Raised[] {
