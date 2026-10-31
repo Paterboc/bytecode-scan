@@ -76,3 +76,57 @@ test('signatures file enables known_scam_* flags', () => {
   const bad = join(tmpdir(), 'nope-does-not-exist.json');
   assert.equal(spawnSync('node', ['dist/cli.js', '--hex', hex, '--signatures', bad]).status, 2);
 });
+
+// ---- function attribution ----
+// WHY: knowing WHICH function carries a hardcoded role is what makes the flag actionable.
+test('flag sites are attributed to the dispatcher function that reaches them', () => {
+  // 0x00-0x13: two PUSH4 EQ PUSH2 JUMPI dispatch entries; 0x14 STOP (fallthrough);
+  // 0x15: A = JUMPDEST STOP; 0x17: B = JUMPDEST PUSH20 CALLER EQ POP STOP
+  const full = '0x' + '63aaaaaaaa14' + '610015' + '57' + '63bbbbbbbb14' + '610017' + '57' + '00'
+    + '5b00' + '5b73' + ADDR + '331450' + '00';
+  const r = scanBytecode(full);
+  const sel = r.selectors.map(s => [s.selector, s.entry]);
+  assert.deepEqual(sel, [['0xaaaaaaaa', 0x15], ['0xbbbbbbbb', 0x17]]);
+  const f = r.flags.find(x => x.tag === 'hardcoded_privileged_caller');
+  assert.deepEqual(f.functions, [{ selector: '0xbbbbbbbb', name: null }]);
+  assert.deepEqual(r.flags.find(x => x.tag === 'no_owner_getter').functions, []);
+});
+
+// WHY: a site outside every function but reachable from the dispatcher fallthrough must not be silently unattributed.
+test('fallthrough-only site is attributed to fallback/unknown', () => {
+  // PUSH4 sel EQ PUSH2 0x0010 JUMPI | SELFDESTRUCT (fallthrough) ... 0x10: JUMPDEST STOP
+  const r = scanBytecode('0x63aaaaaaaa14' + '610010' + '57' + 'ff' + '00'.repeat(5) + '5b00');
+  assert.equal(r.selectors[0].entry, 0x10);
+  assert.deepEqual(r.flags.find(x => x.tag === 'selfdestruct').functions, [{ selector: null, name: 'fallback/unknown' }]);
+});
+
+// ---- auto chain ----
+const { autoDetect } = require('../dist/auto.js');
+const CH = { a: 'ua', b: 'ub', c: 'uc' };
+const fake = (m) => async (url) => { const v = m[url]; if (v instanceof Error) throw v; return v; };
+test('auto: code on one chain', async () => {
+  const r = await autoDetect('0x' + ADDR, CH, fake({ ua: '0x', ub: '0x6000', uc: '0x' }));
+  assert.deepEqual(r.found.map(f => f.chain), ['b']);
+  assert.deepEqual(r.rpcErrors, {});
+});
+test('auto: code on two chains keeps chain order', async () => {
+  const r = await autoDetect('0x' + ADDR, CH, fake({ ua: '0x6000', ub: '0x', uc: '0x6001' }));
+  assert.deepEqual(r.found.map(f => f.chain), ['a', 'c']);
+});
+test('auto: no code anywhere throws', async () => {
+  await assert.rejects(autoDetect('0x' + ADDR, CH, fake({ ua: '0x', ub: '0x', uc: '0x' })), /no contract code on any known chain/);
+});
+test('auto: all chains erroring throws', async () => {
+  const e = new Error('boom');
+  await assert.rejects(autoDetect('0x' + ADDR, CH, fake({ ua: e, ub: e, uc: e })), /all chains failed/);
+});
+test('auto: partial error still succeeds and records rpcErrors', async () => {
+  const r = await autoDetect('0x' + ADDR, CH, fake({ ua: new Error('boom'), ub: '0x6000', uc: '0x' }));
+  assert.deepEqual(r.found.map(f => f.chain), ['b']);
+  assert.equal(r.rpcErrors.a, 'boom');
+});
+test('auto: a hung chain times out instead of blocking', async () => {
+  const r = await autoDetect('0x' + ADDR, { a: 'ua', b: 'ub' }, (u) => u === 'ua' ? new Promise(() => {}) : Promise.resolve('0x6000'), 50);
+  assert.deepEqual(r.found.map(f => f.chain), ['b']);
+  assert.match(r.rpcErrors.a, /timeout/);
+});

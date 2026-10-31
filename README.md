@@ -17,7 +17,8 @@ The `prepare` script builds `dist/` during install. `npx` works too: `npx github
 ## Usage
 
 ```sh
-bytecode 0xTOKEN --chain base               # fetch code via eth_getCode and scan it
+bytecode 0xTOKEN                            # auto: find the chain(s) holding code, scan each
+bytecode 0xTOKEN --chain base               # one chain only
 bytecode 0xTOKEN --rpc https://my.node/rpc  # your own endpoint
 bytecode 0xPROXY --follow-proxy             # also scan the implementation
 bytecode 0xTOKEN --json --no-listing        # machine-readable, no per-function listings
@@ -28,10 +29,10 @@ bytecode --file code.hex
 
 | Option | Meaning |
 | --- | --- |
-| `--chain <name>` | `ethereum` (default), `base`, `arbitrum`, `optimism`, `bsc`, `polygon`, `avalanche`, `robinhood`. These are public endpoints and may rate-limit; use `--rpc` for your own. |
+| `--chain <name>` | `auto` (default; also used when no `--chain`/`--rpc`/`BYTECODE_RPC` is given): queries every built-in chain concurrently (8 s timeout each) and scans each chain that has code, reporting `chain` per result (JSON array when several). Failed chains are noted on stderr and in JSON `rpcErrors`; exit 2 if no chain has code or all errored. Or `ethereum`, `base`, `arbitrum`, `optimism`, `bsc`, `polygon`, `avalanche`, `robinhood`. These are public endpoints and may rate-limit; use `--rpc` for your own. |
 | `--rpc <url>` | JSON-RPC endpoint. Default override: env `BYTECODE_RPC`. |
 | `--follow-proxy` | Detect an EIP-1167 minimal proxy (embedded address) or an EIP-1967 implementation/beacon slot or the legacy OpenZeppelin (zos) slot (`eth_getStorageAt`) and scan the implementation as well. |
-| `--json` | JSON output (an array when a proxy implementation is also scanned). |
+| `--json` | JSON output (an array when a proxy implementation or several chains are scanned). Each result has `chain`; each flag has `functions: [{selector, name}]` listing the dispatcher functions whose bounded walk reaches the flagged instruction (`{selector: null, name: "fallback/unknown"}` for the dispatcher fallthrough, empty for info flags). Text output prints `in: <function>` under each flag. |
 | `--no-listing` | Skip annotated function listings. |
 | `--signatures <file>` | Load a JSON file `{"codeHashes": {"0x<keccak of stripped code>": "label"}, "addresses": {"0x<addr>": "label"}}` merged over the shipped (empty) tables. Default: env `BYTECODE_SIGNATURES`. Invalid file: exit 2. |
 | `--fail-on high` | Exit 1 if any high-severity flag is present. |

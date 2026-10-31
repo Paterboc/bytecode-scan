@@ -18,7 +18,8 @@ const keccakId = (s: string): string => keccak256(Buffer.from(s, 'utf8'));
 
 export interface Op { pc: number; op: number; name: string; data?: string }
 export interface Selector { selector: string; name: string | null; entry: number }
-export interface Flag { tag: string; severity: 'high' | 'info'; detail: string }
+export interface FlagFunction { selector: string | null; name: string | null }
+export interface Flag { tag: string; severity: 'high' | 'info'; detail: string; functions: FlagFunction[] }
 export interface FuncListing { selector: string; name: string | null; entry: number; lines: string[] }
 export interface ScanResult {
   size: number; strippedSize: number; codeHash: string; strippedCodeHash: string;
@@ -141,19 +142,19 @@ function wordString(hex: string): string | null {
   return printable(b.subarray(0, end)) ? b.subarray(0, end).toString('latin1') : null;
 }
 
-function listFunction(ops: Op[], byPc: Map<number, number>, dests: Set<number>, entry: number, code: Buffer): string[] {
-  const lines: string[] = [];
+function listFunction(ops: Op[], byPc: Map<number, number>, dests: Set<number>, entry: number, code: Buffer): { lines: string[]; pcs: Set<number> } {
+  const lines: string[] = []; const pcs = new Set<number>(); // pcs: every op the bounded walk visited (flag attribution)
   const queue = [entry]; const seen = new Set<number>();
   const MAX_BLOCKS = 80, MAX_LINES = 120;
   let strWords: string[] = []; let cond: string | null = null; // function-scoped: revert strings are built in shared helper blocks
   while (queue.length && seen.size < MAX_BLOCKS && lines.length < MAX_LINES) {
     const start = queue.shift()!;
-    if (seen.has(start) || !dests.has(start)) continue;
+    if (seen.has(start) || (start !== entry && !dests.has(start)) || !byPc.has(start)) continue;
     seen.add(start);
     let labelled = false;
     const push = (l: string): void => { if (!labelled) { lines.push(`@0x${start.toString(16)}:`); labelled = true; } lines.push('  ' + l); };
     for (let i = byPc.get(start)!; i < ops.length; i++) {
-      const o = ops[i]; const prev = ops[i - 1];
+      const o = ops[i]; const prev = ops[i - 1]; pcs.add(o.pc);
       const prevData = prev?.data !== undefined ? prev.data.replace(/^0+(?=.)/, '') : '';
       let line: string | null = null;
       if (o.name === 'PUSH32') { const s = wordString(o.data!); if (s) strWords.push(s); }
@@ -194,7 +195,7 @@ function listFunction(ops: Op[], byPc: Map<number, number>, dests: Set<number>, 
       if (o.name === 'JUMPDEST' && o.pc !== start && lines.length > 1 && !strWords.length) { queue.push(o.pc); break; } // fell into next block
     }
   }
-  return lines;
+  return { lines, pcs };
 }
 
 // ---- proxies ----
@@ -209,25 +210,36 @@ export const minimalProxyTarget = (code: Buffer): string | null => {
   return m ? '0x' + m[1] : null;
 };
 
+/** Op pcs reachable from the dispatcher fallthrough (code after the last `PUSH4 sel EQ PUSH JUMPI`), or empty. */
+function fallthroughPcs(ops: Op[], byPc: Map<number, number>, dests: Set<number>, code: Buffer): Set<number> {
+  // ponytail: assumes a linear dispatcher; a binary-search dispatcher's tail may not be the true fallback
+  for (let i = ops.length - 1; i >= 3; i--) {
+    if (ops[i].name === 'JUMPI' && isPush(ops[i - 1]) && ops[i - 2].name === 'EQ' && ops.slice(Math.max(0, i - 6), i - 2).some(x => x.name === 'PUSH4') && ops[i + 1])
+      return listFunction(ops, byPc, dests, ops[i + 1].pc, code).pcs;
+  }
+  return new Set();
+}
+
 // ---- flags ----
-function detectFlags(ops: Op[], stripped: Buffer, strippedHash: string): Flag[] {
-  const flags: Flag[] = [];
+function detectFlags(ops: Op[], stripped: Buffer, strippedHash: string): { flag: Flag; sites: number[] }[] {
+  const flags: { flag: Flag; sites: number[] }[] = [];
+  const add = (tag: string, severity: 'high' | 'info', detail: string, sites: number[] = []): void => { flags.push({ flag: { tag, severity, detail, functions: [] }, sites }); };
   const names = new Set(ops.map(o => o.name));
-  const addrs = new Set<string>(); const privileged = new Set<string>();
+  const addrs = new Map<string, number[]>(); const privileged = new Map<string, number[]>();
   ops.forEach((o, i) => {
     if (o.name !== 'PUSH20' || /^f+$/.test(o.data!)) return;
-    const a = '0x' + o.data!; addrs.add(a);
+    const a = '0x' + o.data!; addrs.set(a, [...(addrs.get(a) ?? []), o.pc]);
     const w = ops.slice(Math.max(0, i - 6), i + 7);
     // PUSH20 const vs CALLER/ORIGIN through EQ, either operand order, DUP/SWAP between
-    if (w.some(x => x.name === 'CALLER' || x.name === 'ORIGIN') && w.some(x => x.name === 'EQ')) privileged.add(a);
+    if (w.some(x => x.name === 'CALLER' || x.name === 'ORIGIN') && w.some(x => x.name === 'EQ')) privileged.set(a, [...(privileged.get(a) ?? []), o.pc, ...w.filter(x => x.name === 'CALLER' || x.name === 'ORIGIN').map(x => x.pc)]);
   });
-  for (const a of privileged) flags.push({ tag: 'hardcoded_privileged_caller', severity: 'high', detail: a });
-  for (const [n, t] of [['SELFDESTRUCT', 'selfdestruct'], ['DELEGATECALL', 'delegatecall'], ['CALLCODE', 'callcode']] as const) if (names.has(n)) flags.push({ tag: t, severity: 'high', detail: n });
-  if (sigs.codeHashes[strippedHash]) flags.push({ tag: 'known_scam_codehash', severity: 'high', detail: sigs.codeHashes[strippedHash] });
-  for (const a of addrs) if (sigs.addresses[a]) flags.push({ tag: 'known_scam_address', severity: 'high', detail: `${a} ${sigs.addresses[a]}` });
-  if (minimalProxyTarget(stripped)) flags.push({ tag: 'minimal_proxy', severity: 'info', detail: `EIP-1167 -> ${minimalProxyTarget(stripped)}` });
+  for (const [a, sites] of privileged) add('hardcoded_privileged_caller', 'high', a, sites);
+  for (const [n, t] of [['SELFDESTRUCT', 'selfdestruct'], ['DELEGATECALL', 'delegatecall'], ['CALLCODE', 'callcode']] as const) if (names.has(n)) add(t, 'high', n, ops.filter(o => o.name === n).map(o => o.pc));
+  if (sigs.codeHashes[strippedHash]) add('known_scam_codehash', 'high', sigs.codeHashes[strippedHash]);
+  for (const [a, sites] of addrs) if (sigs.addresses[a]) add('known_scam_address', 'high', `${a} ${sigs.addresses[a]}`, sites);
+  if (minimalProxyTarget(stripped)) add('minimal_proxy', 'info', `EIP-1167 -> ${minimalProxyTarget(stripped)}`);
   const slot = ops.find(o => o.name === 'PUSH32' && (o.data === EIP1967_IMPL_SLOT || o.data === EIP1967_BEACON_SLOT));
-  if (slot) flags.push({ tag: 'eip1967_proxy', severity: 'info', detail: slot.data === EIP1967_IMPL_SLOT ? 'implementation slot' : 'beacon slot' });
+  if (slot) add('eip1967_proxy', 'info', slot.data === EIP1967_IMPL_SLOT ? 'implementation slot' : 'beacon slot');
   return flags;
 }
 
@@ -239,8 +251,17 @@ export function scanBytecode(hex: string): ScanResult {
   const byPc = new Map(ops.map((o, i) => [o.pc, i]));
   const dests = new Set(ops.filter(o => o.name === 'JUMPDEST').map(o => o.pc));
   const selectors = extractSelectors(ops);
-  const functions = selectors.map(s => ({ ...s, lines: listFunction(ops, byPc, dests, s.entry, stripped) }));
-  const flags = detectFlags(ops, stripped, strippedCodeHash);
-  if (selectors.length && !selectors.some(s => s.selector === '0x8da5cb5b')) flags.push({ tag: 'no_owner_getter', severity: 'info', detail: 'no owner() selector' });
-  return { size: code.length, strippedSize: stripped.length, codeHash: keccak256(code), strippedCodeHash, selectors, functions, flags };
+  const walks = selectors.map(s => ({ ...s, ...listFunction(ops, byPc, dests, s.entry, stripped) }));
+  const functions = walks.map(({ pcs: _p, ...f }) => f);
+  const flags = detectFlags(ops, stripped, strippedCodeHash).map(({ flag, sites }) => {
+    flag.functions = walks.filter(w => sites.some(p => w.pcs.has(p))).map(w => ({ selector: w.selector, name: w.name }));
+    return { flag, sites };
+  });
+  if (selectors.length && flags.some(f => f.sites.length && !f.flag.functions.length)) {
+    const fb = fallthroughPcs(ops, byPc, dests, stripped);
+    for (const f of flags) if (f.sites.length && !f.flag.functions.length && f.sites.some(p => fb.has(p))) f.flag.functions = [{ selector: null, name: 'fallback/unknown' }];
+  }
+  const out = flags.map(f => f.flag);
+  if (selectors.length && !selectors.some(s => s.selector === '0x8da5cb5b')) out.push({ tag: 'no_owner_getter', severity: 'info', detail: 'no owner() selector', functions: [] });
+  return { size: code.length, strippedSize: stripped.length, codeHash: keccak256(code), strippedCodeHash, selectors, functions, flags: out };
 }
