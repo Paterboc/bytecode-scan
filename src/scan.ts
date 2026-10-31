@@ -26,14 +26,14 @@ export interface ScanResult {
   selectors: Selector[]; functions: FuncListing[]; flags: Flag[];
 }
 
-interface Signatures { codeHashes: Record<string, string>; addresses: Record<string, string>; skeletons: Record<string, string> }
+interface Signatures { codeHashes: Record<string, string>; addresses: Record<string, string>; skeletons: Record<string, string>; allowCallers: Record<string, string> }
 const sigs = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'signatures.json'), 'utf8')) as Signatures;
-sigs.skeletons ??= {};
+sigs.skeletons ??= {}; sigs.allowCallers ??= {};
 
 /** Merge a user-supplied signatures JSON file over the shipped tables. Throws on unreadable/invalid input. */
 export function loadSignatures(file: string): void {
   const j = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<Signatures>;
-  for (const k of ['codeHashes', 'addresses', 'skeletons'] as const) {
+  for (const k of ['codeHashes', 'addresses', 'skeletons', 'allowCallers'] as const) {
     const t = j[k] ?? {};
     if (typeof t !== 'object' || Array.isArray(t)) throw new Error(`"${k}" must be an object`);
     for (const [key, v] of Object.entries(t)) sigs[k][key.toLowerCase()] = String(v);
@@ -55,6 +55,7 @@ export const FLAG_EXPLAIN: Record<string, string> = {
   privileged_balance_move: 'A function guarded by a CALLER check against stored state debits a balance-mapping entry for an account taken from calldata without consulting the allowance mapping: the guarded role can move or burn any holder\'s balance.',
   admin_role: 'Info: a CALLER-guarded state write exists with no owner() getter, but it does not reach balances, allowances, supply or a transfer gate.',
   analysis_budget_exceeded: 'The contract is too large or complex for the bounded per-function analysis (too many selectors or walked ops): function listings and the behavioural flags are incomplete. Treat as unverified. The whole-code HIGH pattern checks still ran.',
+  allowed_caller: 'Info: a fixed address is compared with msg.sender/tx.origin, but it is listed in the loaded signatures file\'s allowCallers table (detail = label).',
   known_template: 'Info: the skeleton hash (immutable- and metadata-insensitive fingerprint) matches an entry in the loaded signatures file.',
   no_owner_getter: 'Info: no owner() selector; owner-based probes are not applicable.',
 };
@@ -288,6 +289,7 @@ interface Flow {
   keys: Map<number, bigint>;          // constant storage key per SLOAD/SSTORE
   guards: Map<number, bigint[]>;      // EQ/SUB/XOR pc comparing CALLER with a value SLOADed from these constant slots (the owner/admin slot)
   maps: Map<number, bigint>;          // MSTORE(0x20, const) pc: the constant is a mapping slot about to be hashed
+  callerCmps: Map<number, bigint>;    // EQ/SUB/XOR pc comparing a CALLER/ORIGIN-derived value with an address-sized constant (after masks)
   debits: Set<number>;                // SSTORE pcs storing a value computed as (SLOADed value - x)
 }
 const EFFECT = new Map<number, [number, number]>();
@@ -298,6 +300,8 @@ for (const [list, p, q] of [
   [[0x37, 0x39, 0x3e, 0x5e], 3, 0], [[0x3c], 4, 0], [[0x50, 0xff], 1, 0], [[0x52, 0x53, 0x55, 0x5d, 0xf3, 0xfd], 2, 0],
   [[0xf1, 0xf2], 7, 1], [[0xf4, 0xfa], 6, 1], [[0xf5], 4, 1],
 ] as [number[], number, number][]) for (const b of list) EFFECT.set(b, [p, q]);
+/** Ops whose result is not caller-derived even if an operand is (hashing, storage/memory/calldata loads). */
+const NO_TAINT = new Set([0x20, 0x31, 0x35, 0x3b, 0x3f, 0x51, 0x54, 0x5c]);
 const M256 = (1n << 256n) - 1n;
 const FOLD: Record<number, (a: bigint, b: bigint) => bigint> = {
   0x01: (a, b) => (a + b) & M256, 0x02: (a, b) => (a * b) & M256, 0x03: (a, b) => (a - b) & M256, 0x16: (a, b) => a & b, 0x17: (a, b) => a | b, 0x18: (a, b) => a ^ b,
@@ -308,7 +312,7 @@ const FOLD: Record<number, (a: bigint, b: bigint) => bigint> = {
  * ponytail: intra-block only; values crossing blocks are 'E' (carried). Upgrade path: a real CFG with dataflow.
  */
 function simulate(ops: Op[]): Flow {
-  const jumps = new Map<number, V>(), rets = new Map<number, number[]>(), keys = new Map<number, bigint>(), guards = new Map<number, bigint[]>(), maps = new Map<number, bigint>(), debits = new Set<number>();
+  const jumps = new Map<number, V>(), rets = new Map<number, number[]>(), keys = new Map<number, bigint>(), guards = new Map<number, bigint[]>(), maps = new Map<number, bigint>(), debits = new Set<number>(), callerCmps = new Map<number, bigint>();
   const st: El[] = []; let pending: number[] = []; const small = (ops[ops.length - 1]?.pc ?? 0) < 256;
   const pop = (): El => st.pop() ?? { v: 'E' };
   for (const o of ops) {
@@ -331,15 +335,18 @@ function simulate(ops: Op[]): Flow {
     const args = Array.from({ length: p }, pop);
     const src = [...new Set(args.flatMap(a => a.src ?? []))].slice(0, 8); // dedupe+cap: DUP1 ADD chains would double it per op (OOM on a 60-byte input)
     if ((b === 0x14 || b === 0x03 || b === 0x18) && args.length === 2) for (const [x, y] of [[args[0], args[1]], [args[1], args[0]]]) if (x.caller && y.src?.length) guards.set(o.pc, y.src);
+    if ((b === 0x14 || b === 0x03 || b === 0x18) && args.length === 2) for (const [x, y] of [[args[0], args[1]], [args[1], args[0]]]) {
+      if (x.caller && typeof y.v === 'bigint' && y.v >= 1n << 95n && y.v < 1n << 160n && y.v !== (1n << 160n) - 1n) callerCmps.set(o.pc, y.v); // solc codegen: CALLER EQ/SUB/XOR const, with or without ISZERO, mask folded
+    }
     const f = b in FOLD ? FOLD[b] : undefined;
     for (let k = 0; k < q; k++) {
       const v: V = f && typeof args[0].v === 'bigint' && typeof args[1].v === 'bigint' ? f(args[0].v, args[1].v) : 'C';
       const slot = b === 0x54 ? keys.get(o.pc) : undefined;
-      st.push({ v, src: slot !== undefined ? [slot] : src, caller: b === 0x33 || args.some(a => a.caller), ld: b === 0x54 || args.some(a => a.ld), deb: (b === 0x03 && args.some(a => a.ld)) || args.some(a => a.deb) });
+      st.push({ v, src: slot !== undefined ? [slot] : src, caller: b === 0x33 || b === 0x32 || (!NO_TAINT.has(b) && args.some(a => a.caller)), ld: b === 0x54 || args.some(a => a.ld), deb: (b === 0x03 && args.some(a => a.ld)) || args.some(a => a.deb) });
     }
     if (TERMINATORS.has(o.name)) { st.length = 0; pending = []; }
   }
-  return { jumps, rets, keys, guards, maps, debits };
+  return { jumps, rets, keys, guards, maps, debits, callerCmps };
 }
 const jumpTarget = (flow: Flow, pc: number): number => { const v = flow.jumps.get(pc); return typeof v === 'bigint' && v < 1n << 40n ? Number(v) : -1; };
 /** Static successors of a JUMP/JUMPI: its (folded) constant operand, plus for JUMP every dest-sized constant pushed in its block (callee + return labels). */
@@ -470,7 +477,7 @@ interface Raised { flag: Flag; sites: number[]; anyLive: boolean; allLive: boole
  * opcode flags (SELFDESTRUCT/DELEGATECALL/CALLCODE) over the code region (before the metadata tail) plus any tail op proven reachable.
  * Reachability only attributes functions and gates exemptions; it never decides whether a HIGH flag fires.
  */
-function detectFlags(ops: Op[], byPc: Map<number, number>, stripped: Buffer, strippedHash: string, live: Set<number>): Raised[] {
+function detectFlags(ops: Op[], byPc: Map<number, number>, flow: Flow, stripped: Buffer, strippedHash: string, live: Set<number>): Raised[] {
   const flags: Raised[] = [];
   const add = (tag: string, severity: 'high' | 'medium' | 'info', detail: string, sites: number[] = []): void => {
     const anyLive = sites.some(p => live.has(p));
@@ -487,8 +494,12 @@ function detectFlags(ops: Op[], byPc: Map<number, number>, stripped: Buffer, str
     // address const vs CALLER/ORIGIN through EQ (or SUB/XOR + ISZERO), either operand order, DUP/SWAP between
     if (w.some(x => x.name === 'CALLER' || x.name === 'ORIGIN') && hasCmp(new Set(w.map(x => x.name)))) privileged.set(a, [...(privileged.get(a) ?? []), o.pc, ...w.filter(x => x.name === 'CALLER' || x.name === 'ORIGIN').map(x => x.pc)]);
   });
+  for (const [pc, v] of flow.callerCmps) { const a = '0x' + v.toString(16).padStart(40, '0'); privileged.set(a, [...(privileged.get(a) ?? []), pc]); } // primary: simulated comparison; the window above is the backstop
   let nPriv = 0; // bound: attribution costs walks x sites per flag, so report at most 64 distinct addresses (already a maximal red flag)
-  for (const [a, sites] of privileged) if (nPriv++ < 64) add('hardcoded_privileged_caller', 'high', a, sites);
+  for (const [a, sites] of privileged) {
+    if (sigs.allowCallers[a]) add('allowed_caller', 'info', sigs.allowCallers[a], sites);
+    else if (nPriv++ < 64) add('hardcoded_privileged_caller', 'high', a, sites);
+  }
   for (const [n, t] of [['SELFDESTRUCT', 'selfdestruct'], ['DELEGATECALL', 'delegatecall'], ['CALLCODE', 'callcode']] as const) if (names.has(n)) add(t, 'high', n, floor.filter(o => o.name === n).map(o => o.pc));
   if (sigs.codeHashes[strippedHash]) add('known_scam_codehash', 'high', sigs.codeHashes[strippedHash]);
   for (const [a, sites] of addrs) if (sigs.addresses[a]) add('known_scam_address', 'high', `${a} ${sigs.addresses[a]}`, sites);
@@ -514,7 +525,7 @@ export function scanBytecode(hex: string): ScanResult {
   const walks = selectors.map(s => ({ ...s, ...listFunction(ops, byPc, dests, s.entry, code) }));
   const functions = walks.map(({ pcs: _p, ...f }) => f);
   const fbEntry = selectors.length ? fallbackEntry(ops) : null;
-  const flags = detectFlags(ops, byPc, stripped, strippedCodeHash, live);
+  const flags = detectFlags(ops, byPc, flow, stripped, strippedCodeHash, live);
   const fb = fbEntry !== null && flags.some(f => f.sites.length) ? listFunction(ops, byPc, dests, fbEntry, code).pcs : new Set<number>();
   for (const f of flags) {
     f.flag.functions = walks.filter(w => f.sites.some(p => w.pcs.has(p))).map(w => ({ selector: w.selector, name: w.name }));

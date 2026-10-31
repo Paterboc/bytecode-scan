@@ -402,3 +402,24 @@ test('CODECOPY string flood is bounded in time and listing size', () => {
   assert.ok(JSON.stringify(r.functions).length < 8_000_000);
   assert.ok(r.functions.every(f => f.lines.every(l => l.length < 1400)));
 });
+
+// WHY: solc compiles `msg.sender != X` as CALLER SUB/XOR JUMPI (no ISZERO) and immutables as PUSH32 + mask, landing the comparison outside any short op window.
+test('caller comparison found by simulation: SUB/XOR without ISZERO, immutable word + address mask, far from the constant', () => {
+  const mask = '6001' + '6001' + '60a0' + '1b' + '03' + '16'; // (1 << 160) - 1, AND
+  assert.ok(tags('0x73' + ADDR + '33' + '03' + '600b' + '57' + '00').includes(HC)); // CALLER SUB JUMPI
+  assert.ok(tags('0x73' + ADDR + '33' + '18' + '600b' + '57' + '00').includes(HC)); // CALLER XOR JUMPI
+  assert.ok(tags('0x7f' + '00'.repeat(12) + ADDR + mask + '33' + '14' + '00').includes(HC)); // immutable, comparison at +8
+  assert.ok(tags('0x73' + ADDR + '5f50'.repeat(5) + '33' + '14' + '00').includes(HC)); // constant far from CALLER
+  assert.ok(!tags('0x73' + 'ff'.repeat(20) + '33' + '16' + '00').includes(HC)); // address mask is not a role
+});
+// WHY: public infrastructure addresses are the consumer's call: the signatures allowCallers table downgrades them to info.
+test('allowCallers table turns a hardcoded caller into info allowed_caller', () => {
+  const hex = '0x73' + ADDR + '331400';
+  const f = join(mkdtempSync(join(tmpdir(), 'sig-')), 'sigs.json');
+  writeFileSync(f, JSON.stringify({ allowCallers: { ['0x' + ADDR.toUpperCase()]: 'known infra' } }));
+  const t = JSON.parse(execFileSync('node', ['dist/cli.js', '--hex', hex, '--json', '--signatures', f])).flags;
+  assert.ok(!t.some(x => x.tag === HC));
+  const a = t.find(x => x.tag === 'allowed_caller');
+  assert.equal(a.severity, 'info');
+  assert.equal(a.detail, 'known infra');
+});
