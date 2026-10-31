@@ -137,19 +137,54 @@ test('self_liquidity: removeLiquidity and unlockCallback selectors', () => {
   assert.deepEqual(f.functions.map(x => x.selector), ['0x67b9a286', '0x91dd7346']);
 });
 
-// WHY: Uniswap v4 requires unlockCallback to check msg.sender == PoolManager; that is not a hidden role.
-test('hardcoded caller inside unlockCallback only is suppressed', () => {
-  const guard = '73' + ADDR + '331450' + '00';
-  assert.ok(!tags(contract([['91dd7346', guard]])).includes('hardcoded_privileged_caller'));
-  assert.ok(tags(contract([['91dd7346', guard], ['11223344', guard]])).includes('hardcoded_privileged_caller'));
-  assert.ok(tags(contract([['11223344', guard]])).includes('hardcoded_privileged_caller'));
+// WHY: Uniswap v4 requires unlockCallback to check msg.sender == PoolManager; only that public address is exempt.
+const POOL_MANAGER = '000000000004444c5dc75cb358380d2e3de08a90'; // Uniswap's public Ethereum deployment
+test('PoolManager guard inside unlockCallback is suppressed; any other constant is not', () => {
+  const guard = (a) => '73' + a + '331450' + '00';
+  assert.ok(!tags(contract([['91dd7346', guard(POOL_MANAGER)]])).includes('hardcoded_privileged_caller'));
+  assert.ok(tags(contract([['91dd7346', guard(POOL_MANAGER)], ['11223344', guard(POOL_MANAGER)]])).includes('hardcoded_privileged_caller'));
+  const f = find(contract([['91dd7346', guard(ADDR)]]), 'hardcoded_privileged_caller'); // backdoor named unlockCallback
+  assert.equal(f.severity, 'high');
 });
 
-// WHY: string/data tails decode as fake PUSH20 constants.
-test('PUSH20 in an ASCII string or unreachable tail is not an address', () => {
-  const text = Buffer.from('insufficient balance.').subarray(0, 20).toString('hex');
-  assert.ok(!tags('0x73' + text + '331400').includes('hardcoded_privileged_caller')); // reachable but ASCII
-  assert.ok(!tags('0x00' + '73' + ADDR + '331400').includes('hardcoded_privileged_caller')); // after STOP, unreachable
+// WHY: string/data tails decode as fake ops; only reachable code counts. ASCII-looking constants are NOT exempt (vanity backdoors).
+test('unreachable data tail is ignored; ASCII-looking reachable constant is flagged', () => {
+  assert.ok(!tags('0x00' + '73' + ADDR + '331400').includes('hardcoded_privileged_caller'));
+  assert.ok(!tags('0x00f2').includes('callcode'));
+  const text = Buffer.from('backdoorAddrXYZ').toString('hex') + 'c3d4e5f601';
+  assert.ok(tags('0x73' + text + '331400').includes('hardcoded_privileged_caller'));
+});
+
+// WHY: a jump target pushed as PUSH32 must not hide the code behind it.
+test('PUSH32-dispatched body is still reachable', () => {
+  const pre = '7f' + (35).toString(16).padStart(64, '0') + '56' + '00'; // PUSH32 35 JUMP STOP, JUMPDEST at 35
+  assert.ok(tags('0x' + pre + '5b73' + ADDR + '331400').includes('hardcoded_privileged_caller'));
+});
+
+// WHY: a junk proxy slot (nonzero, pointing at an empty account) must not lose the token's own high-severity result.
+test('--follow-proxy is best-effort: junk implementation slot keeps the main result', async () => {
+  const { createServer } = await import('node:http');
+  const { execFile } = await import('node:child_process');
+  const token = '0x' + 'd2'.repeat(20);
+  const code = contract([['23b872dd', '73' + 'd2'.repeat(20) + '331450' + '00']]);
+  const srv = createServer((req, res) => {
+    let b = ''; req.on('data', d => b += d); req.on('end', () => {
+      const j = JSON.parse(b); let result = '0x';
+      if (j.method === 'eth_getCode') result = j.params[0] === token ? code : '0x';
+      if (j.method === 'eth_getStorageAt') result = '0x' + '00'.repeat(12) + 'ab'.repeat(20);
+      res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ jsonrpc: '2.0', id: j.id, result }));
+    });
+  });
+  await new Promise(r => srv.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${srv.address().port}`;
+  const run = (extra) => new Promise(r => execFile('node', ['dist/cli.js', token, '--rpc', url, '--follow-proxy', '--json', '--no-listing', ...extra], (e, out, err) => r({ code: e ? e.code : 0, out, err })));
+  try {
+    const a = await run([]);
+    assert.equal(a.code, 0);
+    assert.match(a.err, /implementation unavailable/);
+    assert.ok(JSON.parse(a.out).flags.some(f => f.tag === 'hardcoded_privileged_caller'));
+    assert.equal((await run(['--fail-on', 'high'])).code, 1);
+  } finally { srv.close(); }
 });
 
 // ---- auto chain ----

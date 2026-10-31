@@ -58,8 +58,8 @@ async function rpc(url: string, method: string, params: unknown[], timeoutMs = 1
   return j.result!;
 }
 const getCode = (url: string, a: string, t?: number): Promise<string> => rpc(url, 'eth_getCode', [a, 'latest'], t);
-async function slotAddress(url: string, a: string, slot: string): Promise<string | null> {
-  const w = (await rpc(url, 'eth_getStorageAt', [a, '0x' + slot, 'latest'])).replace(/^0x/, '').padStart(64, '0');
+async function slotAddress(url: string, a: string, slot: string, timeoutMs?: number): Promise<string | null> {
+  const w = (await rpc(url, 'eth_getStorageAt', [a, '0x' + slot, 'latest'], timeoutMs)).replace(/^0x/, '').padStart(64, '0');
   return /^0+$/.test(w) ? null : '0x' + w.slice(24);
 }
 
@@ -122,22 +122,28 @@ async function main(): Promise<void> {
       const main = await fetchScan(addr, addr, w.code);
       targets.push(main);
       if (has('--follow-proxy')) {
-        const url = w.url;
-        const raw = Buffer.from(main.raw!.replace(/^0x/, ''), 'hex');
-        let impl: string | null = minimalProxyTarget(raw);
-        let how = 'EIP-1167 minimal proxy';
-        if (!impl) { impl = await slotAddress(url, addr, EIP1967_IMPL_SLOT); how = 'EIP-1967 implementation slot'; }
-        if (!impl) { impl = await slotAddress(url, addr, ZOS_IMPL_SLOT); how = 'legacy OpenZeppelin (zos) implementation slot'; }
-        if (!impl) {
-          const beacon = await slotAddress(url, addr, EIP1967_BEACON_SLOT);
-          if (beacon) {
-            // beacon.implementation() = 0x5c60da1b
-            const bw = (await rpc(url, 'eth_call', [{ to: beacon, data: '0x5c60da1b' }, 'latest'])).replace(/^0x/, '').padStart(64, '0');
-            impl = '0x' + bw.slice(24); how = `EIP-1967 beacon ${beacon}`;
+        // best-effort: any failure here warns on stderr and keeps the main target's result
+        try {
+          const url = w.url, T = 5000;
+          let impl: string | null = minimalProxyTarget(Buffer.from(main.raw!.replace(/^0x/, ''), 'hex'));
+          let how = 'EIP-1167 minimal proxy';
+          if (!impl) {
+            const reads = await Promise.allSettled([EIP1967_IMPL_SLOT, ZOS_IMPL_SLOT, EIP1967_BEACON_SLOT].map(sl => slotAddress(url, addr, sl, T)));
+            const [i67, zos, beacon] = reads.map(r => r.status === 'fulfilled' ? r.value : null);
+            if (i67) { impl = i67; how = 'EIP-1967 implementation slot'; }
+            else if (zos) { impl = zos; how = 'legacy OpenZeppelin (zos) implementation slot'; }
+            else if (beacon) {
+              // beacon.implementation() = 0x5c60da1b
+              const bw = (await rpc(url, 'eth_call', [{ to: beacon, data: '0x5c60da1b' }, 'latest'], T)).replace(/^0x/, '').padStart(64, '0');
+              impl = '0x' + bw.slice(24); how = `EIP-1967 beacon ${beacon}`;
+            } else if (reads.some(r => r.status === 'rejected')) throw new Error('slot read failed');
           }
-        }
-        if (impl) targets.push(await fetchScan(impl, `${impl} (implementation via ${how})`));
-        else console.error('--follow-proxy: no proxy pattern detected');
+          if (impl) {
+            const code = await getCode(url, impl, T);
+            if (!valid(code)) throw new Error(`no code at ${impl}`);
+            targets.push({ title: `${impl} (implementation via ${how})`, address: impl, result: scanBytecode(code), raw: code, chain: w.chain, rpcErrors });
+          } else console.error('--follow-proxy: no proxy pattern detected');
+        } catch (e) { console.error(`--follow-proxy: implementation unavailable: ${(e as Error).message}`); }
       }
     }
   }

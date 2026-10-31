@@ -86,7 +86,7 @@ const KNOWN_SIGS = [
   'permit(address,address,uint256,uint256,uint8,bytes32,bytes32)', 'nonces(address)', 'DOMAIN_SEPARATOR()', 'factory()', 'WETH()', 'WETH9()',
   'swapExactTokensForTokens(uint256,uint256,address[],address,uint256)', 'swapExactETHForTokens(uint256,address[],address,uint256)',
   'addLiquidity(address,address,uint256,uint256,uint256,uint256,address,uint256)', 'addLiquidityETH(address,uint256,uint256,uint256,address,uint256)',
-  'removeLiquidity(address,address,uint256,uint256,uint256,address,uint256)', 'execute(bytes,bytes[],uint256)', 'initialize()', 'upgradeTo(address)', 'implementation()',
+  'removeLiquidity(address,address,uint256,uint256,uint256,address,uint256)', 'removeLiquidity()', 'removeLiquidity(address,uint256)', 'unlockCallback(bytes)', 'execute(bytes,bytes[],uint256)', 'initialize()', 'upgradeTo(address)', 'implementation()',
 ];
 const SEL_NAMES = new Map<string, string>(KNOWN_SIGS.map(s => [keccakId(s).slice(0, 10), s]));
 const TOPICS = new Map<string, string>(
@@ -224,6 +224,8 @@ function fallthroughPcs(ops: Op[], byPc: Map<number, number>, dests: Set<number>
 }
 
 // ---- reachability and per-function facts ----
+/** Jump target from a PUSHn payload of any width (leading zeros stripped), or -1 if too large to be a pc. */
+const jumpDest = (hex: string): number => { const t = hex.replace(/^0+/, ''); return t.length > 12 ? -1 : parseInt(t || '0', 16); };
 /** Pcs of ops reachable from pc 0 via fallthrough and PUSH-ed JUMPDEST targets; the rest is data/string tail. */
 function livePcs(ops: Op[], byPc: Map<number, number>, dests: Set<number>): Set<number> {
   const live = new Set<number>(); const q = [0];
@@ -231,14 +233,12 @@ function livePcs(ops: Op[], byPc: Map<number, number>, dests: Set<number>): Set<
     const p = q.pop()!; if (!byPc.has(p)) continue;
     for (let i = byPc.get(p)!; i < ops.length && !live.has(ops[i].pc); i++) {
       const o = ops[i]; live.add(o.pc);
-      if (o.data && o.data.length <= 16) { const v = parseInt(o.data, 16); if (dests.has(v) && !live.has(v)) q.push(v); }
+      if (o.data) { const v = jumpDest(o.data); if (dests.has(v) && !live.has(v)) q.push(v); }
       if (TERMINATORS.has(o.name)) break;
     }
   }
   return live;
 }
-/** >= 75% printable ASCII bytes: a string literal that happens to be PUSH20-sized, not an address. */
-const looksAscii = (hex: string): boolean => Buffer.from(hex, 'hex').filter(c => c >= 0x20 && c < 0x7f).length * 4 >= hex.length / 2 * 3;
 
 /** Op names, constant slots read (PUSHn slot SLOAD) and written (small PUSH within 14 ops before SSTORE) on the walk from `entry`. */
 function reachFacts(ops: Op[], byPc: Map<number, number>, dests: Set<number>, entry: number): { names: Set<string>; rd: Set<number>; wr: Set<number> } {
@@ -249,7 +249,7 @@ function reachFacts(ops: Op[], byPc: Map<number, number>, dests: Set<number>, en
     seen.add(p);
     for (let i = byPc.get(p)!; i < ops.length; n++) {
       const o = ops[i];
-      if (o.data && o.data.length <= 16) { const v = parseInt(o.data, 16); if (dests.has(v) && !seen.has(v)) q.push(v); }
+      if (o.data) { const v = jumpDest(o.data); if (dests.has(v) && !seen.has(v)) q.push(v); }
       names.add(o.name);
       const pv = ops[i - 1];
       if (o.name === 'SLOAD' && pv && (pv.name === 'PUSH1' || pv.name === 'PUSH2')) rd.add(parseInt(pv.data!, 16));
@@ -265,6 +265,12 @@ function reachFacts(ops: Op[], byPc: Map<number, number>, dests: Set<number>, en
 const STD_SELS = new Set([...'name() symbol() decimals() totalSupply() balanceOf(address) transfer(address,uint256) transferFrom(address,address,uint256) approve(address,uint256) allowance(address,address) increaseAllowance(address,uint256) decreaseAllowance(address,uint256) owner() renounceOwnership() transferOwnership(address) permit(address,address,uint256,uint256,uint8,bytes32,bytes32) nonces(address) DOMAIN_SEPARATOR() eip712Domain()'.split(' ')].map(s => keccakId(s).slice(0, 10)));
 const SEL_OWNER = '0x8da5cb5b', SEL_TRANSFER = '0xa9059cbb', SEL_TRANSFER_FROM = '0x23b872dd', SEL_UNLOCK_CALLBACK = '0x91dd7346';
 // removeLiquidity(), removeLiquidity(address,uint256), unlockCallback(bytes)
+/** Official Uniswap v4 PoolManager deployments (mainnets, from the public deployments page). unlockCallback must check msg.sender == PoolManager. */
+const POOL_MANAGERS = new Set(['0x000000000004444c5dc75cb358380d2e3de08a90', '0x1f98400000000000000000000000000000000004', '0x9a13f98cb987694c9f086b1f5eb990eea8264ec3',
+  '0x498581ff718922c3f8e6a244956af099b2652b2b', '0x360e68faccca8ca495c1b759fd9eee466db9fb32', '0x67366782805870060151383f4bbff9dab53e5cd6', '0x0575338e4c17006ae181b47900a84404247ca30f',
+  '0xb1860d529182ac3bc1f51fa2abd56662b7d13f33', '0x06380c0e0912312b5150364b9dc4542ba0dbbc85', '0x28e2ea090877bf75740558f6bfb36a5ffee9e9df', '0x288dc841a52fca2707c6947b3a777c5e56cd87bc',
+  '0x188d586ddcf52439676ca21a244753fa19f9ea8e', '0xacb7e78fa05d562e0a5d3089ec896d57d057d38e', '0x33620f62c5b9b2086dd6b62f4a297a9f30347029', '0x8366a39cc670b4001a1121b8f6a443a643e40951',
+  '0x12d4fd9c5dedd00ab8a0bce2cf0167bbf94b6b1f']);
 const SELF_LIQ_SELS = new Set(['0x67b9a286', '0xa201ccf6', SEL_UNLOCK_CALLBACK]);
 
 function behaviourFlags(ops: Op[], byPc: Map<number, number>, dests: Set<number>, selectors: Selector[], privilegedSels: Set<string | null>): Flag[] {
@@ -290,17 +296,17 @@ function behaviourFlags(ops: Op[], byPc: Map<number, number>, dests: Set<number>
 function detectFlags(ops: Op[], stripped: Buffer, strippedHash: string, live: Set<number>): { flag: Flag; sites: number[] }[] {
   const flags: { flag: Flag; sites: number[] }[] = [];
   const add = (tag: string, severity: 'high' | 'medium' | 'info', detail: string, sites: number[] = []): void => { flags.push({ flag: { tag, severity, detail, functions: [] }, sites }); };
-  const names = new Set(ops.map(o => o.name));
+  const names = new Set(ops.filter(o => live.has(o.pc)).map(o => o.name));
   const addrs = new Map<string, number[]>(); const privileged = new Map<string, number[]>();
   ops.forEach((o, i) => {
-    if (o.name !== 'PUSH20' || /^f+$/.test(o.data!) || !live.has(o.pc) || looksAscii(o.data!)) return; // data/string tails decode as fake PUSH20s
+    if (o.name !== 'PUSH20' || /^f+$/.test(o.data!) || !live.has(o.pc)) return; // data/string tails decode as fake PUSH20s; only reachable code counts
     const a = '0x' + o.data!; addrs.set(a, [...(addrs.get(a) ?? []), o.pc]);
     const w = ops.slice(Math.max(0, i - 6), i + 7);
     // PUSH20 const vs CALLER/ORIGIN through EQ, either operand order, DUP/SWAP between
     if (w.some(x => x.name === 'CALLER' || x.name === 'ORIGIN') && w.some(x => x.name === 'EQ')) privileged.set(a, [...(privileged.get(a) ?? []), o.pc, ...w.filter(x => x.name === 'CALLER' || x.name === 'ORIGIN').map(x => x.pc)]);
   });
   for (const [a, sites] of privileged) add('hardcoded_privileged_caller', 'high', a, sites);
-  for (const [n, t] of [['SELFDESTRUCT', 'selfdestruct'], ['DELEGATECALL', 'delegatecall'], ['CALLCODE', 'callcode']] as const) if (names.has(n)) add(t, 'high', n, ops.filter(o => o.name === n).map(o => o.pc));
+  for (const [n, t] of [['SELFDESTRUCT', 'selfdestruct'], ['DELEGATECALL', 'delegatecall'], ['CALLCODE', 'callcode']] as const) if (names.has(n)) add(t, 'high', n, ops.filter(o => o.name === n && live.has(o.pc)).map(o => o.pc));
   if (sigs.codeHashes[strippedHash]) add('known_scam_codehash', 'high', sigs.codeHashes[strippedHash]);
   for (const [a, sites] of addrs) if (sigs.addresses[a]) add('known_scam_address', 'high', `${a} ${sigs.addresses[a]}`, sites);
   if (minimalProxyTarget(stripped)) add('minimal_proxy', 'info', `EIP-1167 -> ${minimalProxyTarget(stripped)}`);
@@ -327,8 +333,8 @@ export function scanBytecode(hex: string): ScanResult {
     const fb = fallthroughPcs(ops, byPc, dests, stripped);
     for (const f of flags) if (f.sites.length && !f.flag.functions.length && f.sites.some(p => fb.has(p))) f.flag.functions = [{ selector: null, name: 'fallback/unknown' }];
   }
-  // Uniswap v4 unlockCallback must check msg.sender == PoolManager: legitimate, not a hidden role
-  const kept = flags.filter(f => !(f.flag.tag === 'hardcoded_privileged_caller' && f.flag.functions.length && f.flag.functions.every(x => x.selector === SEL_UNLOCK_CALLBACK)));
+  // Uniswap v4 unlockCallback must check msg.sender == the canonical PoolManager: legitimate; any other constant stays flagged
+  const kept = flags.filter(f => !(f.flag.tag === 'hardcoded_privileged_caller' && POOL_MANAGERS.has(f.flag.detail) && f.flag.functions.length && f.flag.functions.every(x => x.selector === SEL_UNLOCK_CALLBACK)));
   const privileged = new Set(kept.filter(f => f.flag.tag === 'hardcoded_privileged_caller').flatMap(f => f.flag.functions.map(x => x.selector)));
   const out = kept.map(f => f.flag).concat(behaviourFlags(ops, byPc, dests, selectors, privileged));
   if (selectors.length && !selectors.some(s => s.selector === '0x8da5cb5b')) out.push({ tag: 'no_owner_getter', severity: 'info', detail: 'no owner() selector', functions: [] });

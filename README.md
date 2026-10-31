@@ -43,7 +43,7 @@ Exit codes: `0` analysed, `1` `--fail-on` tripped, `2` usage or fetch error.
 
 | Tag | Severity | Meaning |
 | --- | --- | --- |
-| `hardcoded_privileged_caller` | high | A fixed address constant (in reachable code, not ASCII text) is compared with `msg.sender`/`tx.origin`: a compile-time privileged role that `owner()`-style checks cannot see. Not raised when the only function reaching it is Uniswap v4 `unlockCallback(bytes)`, which must check the PoolManager. |
+| `hardcoded_privileged_caller` | high | A fixed address constant (in reachable code) is compared with `msg.sender`/`tx.origin`: a compile-time privileged role that `owner()`-style checks cannot see. Not raised when the only function reaching it is Uniswap v4 `unlockCallback(bytes)` and the constant is an official Uniswap v4 PoolManager address. |
 | `selfdestruct` | high | Contains `SELFDESTRUCT`. |
 | `delegatecall` | high | Contains `DELEGATECALL` (foreign code in this contract's storage). |
 | `callcode` | high | Contains deprecated `CALLCODE`. |
