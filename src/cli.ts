@@ -11,7 +11,7 @@ const CHAINS: Record<string, string> = {
   arbitrum: 'https://arb1.arbitrum.io/rpc',
   optimism: 'https://mainnet.optimism.io',
   bsc: 'https://bsc-dataseed.binance.org',
-  polygon: 'https://polygon-rpc.com',
+  polygon: 'https://polygon-bor-rpc.publicnode.com',
   avalanche: 'https://api.avax.network/ext/bc/C/rpc',
   robinhood: 'https://robinhood.drpc.org',
 };
@@ -63,7 +63,7 @@ async function slotAddress(url: string, a: string, slot: string, timeoutMs?: num
   return /^0+$/.test(w) ? null : '0x' + w.slice(24);
 }
 
-interface Target { title: string; address?: string; result: ScanResult; raw?: string; chain: string | null; url?: string; rpcErrors?: Record<string, string> }
+interface Target { title: string; address?: string; result: ScanResult; raw?: string; chain: string | null; url?: string; rpcErrors?: Record<string, string>; incomplete: string[] }
 function show(t: Target, listing: boolean): void {
   const r = t.result;
   console.log(`== ${t.title}${t.chain ? ` [${t.chain}]` : ''}: ${r.size} bytes (${r.strippedSize} without metadata)`);
@@ -98,7 +98,7 @@ async function main(): Promise<void> {
   if (!hex && val('--file')) { try { hex = fs.readFileSync(val('--file')!, 'utf8').trim(); } catch (e) { die(`cannot read file: ${(e as Error).message}`); } }
   if (hex !== undefined) {
     if (!valid(hex)) die('no code (empty/invalid hex)');
-    targets.push({ title: 'bytecode', result: scanBytecode(hex), chain: null });
+    targets.push({ title: 'bytecode', result: scanBytecode(hex), chain: null, incomplete: [] });
   } else {
     const addr = args.find((a, i) => /^0x[0-9a-fA-F]{40}$/.test(a) && !FLAGS_WITH_VALUE.has(args[i - 1]));
     if (!addr) die(HELP);
@@ -117,7 +117,7 @@ async function main(): Promise<void> {
       const fetchScan = async (a: string, title: string, code?: string): Promise<Target> => {
         code ??= await getCode(w.url, a);
         if (!valid(code)) die(`no code at ${a} (EOA or empty account)`);
-        return { title, address: a, result: scanBytecode(code), raw: code, chain: w.chain, rpcErrors };
+        return { title, address: a, result: scanBytecode(code), raw: code, chain: w.chain, rpcErrors, incomplete: [] };
       };
       const main = await fetchScan(addr, addr, w.code);
       targets.push(main);
@@ -130,6 +130,7 @@ async function main(): Promise<void> {
           if (!impl) {
             const reads = await Promise.allSettled([EIP1967_IMPL_SLOT, ZOS_IMPL_SLOT, EIP1967_BEACON_SLOT].map(sl => slotAddress(url, addr, sl, T)));
             const [i67, zos, beacon] = reads.map(r => r.status === 'fulfilled' ? r.value : null);
+            for (const r of reads) if (r.status === 'rejected') main.incomplete.push(`follow-proxy: proxy slot read failed: ${(r.reason as Error).message}`);
             if (i67) { impl = i67; how = 'EIP-1967 implementation slot'; }
             else if (zos) { impl = zos; how = 'legacy OpenZeppelin (zos) implementation slot'; }
             else if (beacon) {
@@ -141,15 +142,18 @@ async function main(): Promise<void> {
           if (impl) {
             const code = await getCode(url, impl, T);
             if (!valid(code)) throw new Error(`no code at ${impl}`);
-            targets.push({ title: `${impl} (implementation via ${how})`, address: impl, result: scanBytecode(code), raw: code, chain: w.chain, rpcErrors });
+            targets.push({ title: `${impl} (implementation via ${how})`, address: impl, result: scanBytecode(code), raw: code, chain: w.chain, rpcErrors, incomplete: [] });
           } else console.error('--follow-proxy: no proxy pattern detected');
-        } catch (e) { console.error(`--follow-proxy: implementation unavailable: ${(e as Error).message}`); }
+        } catch (e) {
+          const m = `follow-proxy: implementation unavailable: ${(e as Error).message}`;
+          console.error('--' + m); main.incomplete.push(m);
+        }
       }
     }
   }
 
   if (json) {
-    const out = targets.map(t => ({ address: t.address ?? null, chain: t.chain, ...(t.rpcErrors ? { rpcErrors: t.rpcErrors } : {}), ...t.result, functions: listing ? t.result.functions : undefined }));
+    const out = targets.map(t => ({ address: t.address ?? null, chain: t.chain, ...(t.rpcErrors ? { rpcErrors: t.rpcErrors } : {}), ...(t.incomplete.length ? { incomplete: t.incomplete } : {}), ...t.result, functions: listing ? t.result.functions : undefined }));
     console.log(JSON.stringify(out.length === 1 ? out[0] : out, null, 2));
   } else targets.forEach(t => show(t, listing));
   if (failOn === 'high' && targets.some(t => t.result.flags.some(f => f.severity === 'high'))) process.exit(1);

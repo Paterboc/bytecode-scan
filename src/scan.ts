@@ -214,78 +214,146 @@ export const minimalProxyTarget = (code: Buffer): string | null => {
 };
 
 /** Op pcs reachable from the dispatcher fallthrough (code after the last `PUSH4 sel EQ PUSH JUMPI`), or empty. */
-function fallthroughPcs(ops: Op[], byPc: Map<number, number>, dests: Set<number>, code: Buffer): Set<number> {
+function fallbackEntry(ops: Op[]): number | null {
   // ponytail: assumes a linear dispatcher; a binary-search dispatcher's tail may not be the true fallback
   for (let i = ops.length - 1; i >= 3; i--) {
-    if (ops[i].name === 'JUMPI' && isPush(ops[i - 1]) && ops[i - 2].name === 'EQ' && ops.slice(Math.max(0, i - 6), i - 2).some(x => x.name === 'PUSH4') && ops[i + 1])
-      return listFunction(ops, byPc, dests, ops[i + 1].pc, code).pcs;
+    if (ops[i].name === 'JUMPI' && isPush(ops[i - 1]) && ops[i - 2].name === 'EQ' && ops.slice(Math.max(0, i - 6), i - 2).some(x => x.name === 'PUSH4') && ops[i + 1]) return ops[i + 1].pc;
   }
-  return new Set();
+  return null;
 }
 
-// ---- reachability and per-function facts ----
+// ---- reachability, stack simulation and per-function facts ----
 /** Jump target from a PUSHn payload of any width (leading zeros stripped), or -1 if too large to be a pc. */
 const jumpDest = (hex: string): number => { const t = hex.replace(/^0+/, ''); return t.length > 12 ? -1 : parseInt(t || '0', 16); };
-/** Pcs of ops reachable from pc 0 via fallthrough and PUSH-ed JUMPDEST targets; the rest is data/string tail. */
-function livePcs(ops: Op[], byPc: Map<number, number>, dests: Set<number>): Set<number> {
-  const live = new Set<number>(); const q = [0];
-  while (q.length) {
-    const p = q.pop()!; if (!byPc.has(p)) continue;
-    for (let i = byPc.get(p)!; i < ops.length && !live.has(ops[i].pc); i++) {
-      const o = ops[i]; live.add(o.pc);
-      if (o.data) { const v = jumpDest(o.data); if (dests.has(v) && !live.has(v)) q.push(v); }
-      if (TERMINATORS.has(o.name)) break;
-    }
+
+type V = bigint | 'E' | 'C'; // constant | carried in from an earlier block | computed in this block
+interface Flow { jumps: Map<number, V>; keys: Map<number, bigint> } // jump operand per JUMP/JUMPI pc; constant storage key per SLOAD/SSTORE pc
+const EFFECT = new Map<number, [number, number]>();
+for (const [list, p, q] of [
+  [[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0a, 0x0b, 0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1c, 0x1d, 0x20], 2, 1],
+  [[0x08, 0x09, 0xf0], 3, 1], [[0x15, 0x19, 0x31, 0x35, 0x3b, 0x3f, 0x40, 0x49, 0x51, 0x54, 0x5c], 1, 1],
+  [[0x30, 0x32, 0x33, 0x34, 0x36, 0x38, 0x3a, 0x3d, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x4a, 0x58, 0x59, 0x5a], 0, 1],
+  [[0x37, 0x39, 0x3e, 0x5e], 3, 0], [[0x3c], 4, 0], [[0x50, 0xff], 1, 0], [[0x52, 0x53, 0x55, 0x5d, 0xf3, 0xfd], 2, 0],
+  [[0xf1, 0xf2], 7, 1], [[0xf4, 0xfa], 6, 1], [[0xf5], 4, 1],
+] as [number[], number, number][]) for (const b of list) EFFECT.set(b, [p, q]);
+const M256 = (1n << 256n) - 1n;
+const FOLD: Record<number, (a: bigint, b: bigint) => bigint> = {
+  0x01: (a, b) => (a + b) & M256, 0x02: (a, b) => (a * b) & M256, 0x03: (a, b) => (a - b) & M256, 0x16: (a, b) => a & b, 0x17: (a, b) => a | b, 0x18: (a, b) => a ^ b,
+  0x1b: (a, b) => a >= 256n ? 0n : (b << a) & M256, 0x1c: (a, b) => a >= 256n ? 0n : b >> a,
+};
+/**
+ * Per-basic-block constant-propagating stack simulation (stack empty at each JUMPDEST).
+ * ponytail: intra-block only; values crossing blocks are 'E' (carried). Upgrade path: a real CFG with dataflow.
+ */
+function simulate(ops: Op[]): Flow {
+  const jumps = new Map<number, V>(), keys = new Map<number, bigint>(); const st: V[] = [];
+  const pop = (): V => st.pop() ?? 'E';
+  for (const o of ops) {
+    const b = o.op;
+    if (b === 0x5b) { st.length = 0; continue; }
+    if (b >= 0x60 && b <= 0x7f) { st.push(BigInt('0x' + (o.data || '0'))); continue; }
+    if (b === 0x5f) { st.push(0n); continue; }
+    if (b >= 0x80 && b <= 0x8f) { st.push(st[st.length - (b - 0x7f)] ?? 'E'); continue; }
+    if (b >= 0x90 && b <= 0x9f) { const n = b - 0x8f; while (st.length <= n) st.unshift('E'); const t = st.length - 1; [st[t], st[t - n]] = [st[t - n], st[t]]; continue; }
+    if (b === 0x56 || b === 0x57) { jumps.set(o.pc, pop()); if (b === 0x57) pop(); else st.length = 0; continue; }
+    if ((b === 0x54 || b === 0x55) && typeof st[st.length - 1] === 'bigint') keys.set(o.pc, st[st.length - 1] as bigint);
+    if (b >= 0xa0 && b <= 0xa4) { for (let k = 0; k < 2 + b - 0xa0; k++) pop(); continue; }
+    const [p, q] = EFFECT.get(b) ?? [0, 0];
+    const args = Array.from({ length: p }, pop);
+    const f = b in FOLD ? FOLD[b] : undefined;
+    for (let k = 0; k < q; k++) st.push(f && typeof args[0] === 'bigint' && typeof args[1] === 'bigint' ? f(args[0], args[1]) : 'C');
+    if (TERMINATORS.has(o.name)) st.length = 0;
   }
-  return live;
+  return { jumps, keys };
+}
+const jumpTarget = (flow: Flow, pc: number): number => { const v = flow.jumps.get(pc); return typeof v === 'bigint' && v < 1n << 40n ? Number(v) : -1; };
+
+/**
+ * Pcs of ops reachable from pc 0 via fallthrough and statically resolved JUMPDEST targets (PUSHed or constant-folded); the rest is data/string tail.
+ * Fail closed: if a reachable JUMP/JUMPI target is computed in-block (unresolvable), every JUMPDEST below `codeEnd` (the code region, before the metadata tail) is treated as live.
+ */
+function livePcs(ops: Op[], byPc: Map<number, number>, dests: Set<number>, flow: Flow, codeEnd: number): Set<number> {
+  const live = new Set<number>(); const q = [0]; let computed = false, seeded = false;
+  for (;;) {
+    while (q.length) {
+      const p = q.pop()!; if (!byPc.has(p)) continue;
+      for (let i = byPc.get(p)!; i < ops.length && !live.has(ops[i].pc); i++) {
+        const o = ops[i]; live.add(o.pc);
+        if (o.data) { const v = jumpDest(o.data); if (dests.has(v) && !live.has(v)) q.push(v); }
+        if (o.op === 0x56 || o.op === 0x57) { const t = jumpTarget(flow, o.pc); if (dests.has(t) && !live.has(t)) q.push(t); if (flow.jumps.get(o.pc) === 'C') computed = true; }
+        if (TERMINATORS.has(o.name)) break;
+      }
+    }
+    if (!computed || seeded) return live;
+    seeded = true; for (const d of dests) if (d < codeEnd && !live.has(d)) q.push(d);
+  }
 }
 
-/** Op names, constant slots read (PUSHn slot SLOAD) and written (small PUSH within 14 ops before SSTORE) on the walk from `entry`. */
-function reachFacts(ops: Op[], byPc: Map<number, number>, dests: Set<number>, entry: number): { names: Set<string>; rd: Set<number>; wr: Set<number> } {
-  // ponytail: heuristic slot detection (constants <= 0x40 near SSTORE), not symbolic; capped at 4000 ops. Upgrade path: stack tracking.
-  const names = new Set<string>(), rd = new Set<number>(), wr = new Set<number>(), seen = new Set<number>(); const q = [entry]; let n = 0;
+type Slots = Set<bigint>;
+/** Op names and constant storage slots read/written on the walk from `entry`; `guard` = slots SLOADed next to a CALLER check (the owner/admin slot). */
+function reachFacts(ops: Op[], byPc: Map<number, number>, dests: Set<number>, flow: Flow, entry: number): { names: Set<string>; rd: Slots; wr: Slots; guard: Slots } {
+  // ponytail: slots come from intra-block constant propagation; unresolved keys fall back to a nearby-PUSH1/2 heuristic. Capped at 4000 ops.
+  const names = new Set<string>(), rd: Slots = new Set(), wr: Slots = new Set(), guard: Slots = new Set(), seen = new Set<number>(); const q = [entry]; let n = 0;
   while (q.length && n < 4000) {
     const p = q.pop()!; if (seen.has(p) || !byPc.has(p)) continue;
     seen.add(p);
     for (let i = byPc.get(p)!; i < ops.length; n++) {
       const o = ops[i];
       if (o.data) { const v = jumpDest(o.data); if (dests.has(v) && !seen.has(v)) q.push(v); }
+      if (o.op === 0x56 || o.op === 0x57) { const t = jumpTarget(flow, o.pc); if (dests.has(t) && !seen.has(t)) q.push(t); }
       names.add(o.name);
-      const pv = ops[i - 1];
-      if (o.name === 'SLOAD' && pv && (pv.name === 'PUSH1' || pv.name === 'PUSH2')) rd.add(parseInt(pv.data!, 16));
-      if (o.name === 'SSTORE') for (const x of ops.slice(Math.max(0, i - 14), i).reverse().filter((y, k, w) => !w.slice(0, k).some(z => z.name === 'JUMPDEST' || TERMINATORS.has(z.name)))) if ((x.name === 'PUSH1' || x.name === 'PUSH2') && parseInt(x.data!, 16) <= 0x40 && !['00', '01', '20', '40', 'ff'].includes(x.data!)) wr.add(parseInt(x.data!, 16));
+      const pv = ops[i - 1], k = flow.keys.get(o.pc);
+      if (o.name === 'SLOAD') { if (k !== undefined) rd.add(k); else if (pv && (pv.name === 'PUSH1' || pv.name === 'PUSH2')) rd.add(BigInt('0x' + pv.data!)); }
+      if (o.name === 'SSTORE') {
+        if (k !== undefined) wr.add(k);
+        else for (const x of ops.slice(Math.max(0, i - 14), i).reverse().filter((y, j, w) => !w.slice(0, j).some(z => z.name === 'JUMPDEST' || TERMINATORS.has(z.name)))) if ((x.name === 'PUSH1' || x.name === 'PUSH2') && parseInt(x.data!, 16) <= 0x40 && !['00', '01', '20', '40', 'ff'].includes(x.data!)) wr.add(BigInt('0x' + x.data!));
+      }
+      if (o.name === 'CALLER') { // SLOAD keys within 10 ops of CALLER, in the same basic block
+        for (let j = i - 1; j >= Math.max(0, i - 10) && ops[j].name !== 'JUMPDEST' && !TERMINATORS.has(ops[j].name); j--) if (ops[j].name === 'SLOAD' && flow.keys.has(ops[j].pc)) guard.add(flow.keys.get(ops[j].pc)!);
+        for (let j = i + 1; j <= i + 10 && j < ops.length && ops[j].name !== 'JUMPDEST' && !TERMINATORS.has(ops[j - 1].name); j++) if (ops[j].name === 'SLOAD' && flow.keys.has(ops[j].pc)) guard.add(flow.keys.get(ops[j].pc)!);
+      }
       if (TERMINATORS.has(o.name)) break;
       i++;
       if (ops[i]?.name === 'JUMPDEST') { if (seen.has(ops[i].pc)) break; seen.add(ops[i].pc); }
     }
   }
-  return { names, rd, wr };
+  return { names, rd, wr, guard };
 }
 
-const STD_SELS = new Set([...'name() symbol() decimals() totalSupply() balanceOf(address) transfer(address,uint256) transferFrom(address,address,uint256) approve(address,uint256) allowance(address,address) increaseAllowance(address,uint256) decreaseAllowance(address,uint256) owner() renounceOwnership() transferOwnership(address) permit(address,address,uint256,uint256,uint8,bytes32,bytes32) nonces(address) DOMAIN_SEPARATOR() eip712Domain()'.split(' ')].map(s => keccakId(s).slice(0, 10)));
+const sel4 = (s: string): string => keccakId(s).slice(0, 10);
 const SEL_OWNER = '0x8da5cb5b', SEL_TRANSFER = '0xa9059cbb', SEL_TRANSFER_FROM = '0x23b872dd', SEL_UNLOCK_CALLBACK = '0x91dd7346';
-// removeLiquidity(), removeLiquidity(address,uint256), unlockCallback(bytes)
+/** Core ERC20 entry points: not admin setters, so not considered as guarded writers. */
+const CORE_SELS = new Set(['transfer(address,uint256)', 'transferFrom(address,address,uint256)', 'approve(address,uint256)', 'increaseAllowance(address,uint256)', 'decreaseAllowance(address,uint256)', 'permit(address,address,uint256,uint256,uint8,bytes32,bytes32)'].map(sel4));
 /** Official Uniswap v4 PoolManager deployments (mainnets, from the public deployments page). unlockCallback must check msg.sender == PoolManager. */
 const POOL_MANAGERS = new Set(['0x000000000004444c5dc75cb358380d2e3de08a90', '0x1f98400000000000000000000000000000000004', '0x9a13f98cb987694c9f086b1f5eb990eea8264ec3',
   '0x498581ff718922c3f8e6a244956af099b2652b2b', '0x360e68faccca8ca495c1b759fd9eee466db9fb32', '0x67366782805870060151383f4bbff9dab53e5cd6', '0x0575338e4c17006ae181b47900a84404247ca30f',
   '0xb1860d529182ac3bc1f51fa2abd56662b7d13f33', '0x06380c0e0912312b5150364b9dc4542ba0dbbc85', '0x28e2ea090877bf75740558f6bfb36a5ffee9e9df', '0x288dc841a52fca2707c6947b3a777c5e56cd87bc',
   '0x188d586ddcf52439676ca21a244753fa19f9ea8e', '0xacb7e78fa05d562e0a5d3089ec896d57d057d38e', '0x33620f62c5b9b2086dd6b62f4a297a9f30347029', '0x8366a39cc670b4001a1121b8f6a443a643e40951',
   '0x12d4fd9c5dedd00ab8a0bce2cf0167bbf94b6b1f']);
+// removeLiquidity(), removeLiquidity(address,uint256), unlockCallback(bytes)
 const SELF_LIQ_SELS = new Set(['0x67b9a286', '0xa201ccf6', SEL_UNLOCK_CALLBACK]);
 
-function behaviourFlags(ops: Op[], byPc: Map<number, number>, dests: Set<number>, selectors: Selector[], privilegedSels: Set<string | null>): Flag[] {
+/** Comparison forms: EQ, or SUB/XOR followed by ISZERO. */
+const hasCmp = (names: Set<string>): boolean => names.has('EQ') || (names.has('ISZERO') && (names.has('SUB') || names.has('XOR')));
+const fmtSlot = (s: bigint): string => s < 1n << 32n ? String(s) : '0x' + s.toString(16);
+
+function behaviourFlags(ops: Op[], byPc: Map<number, number>, dests: Set<number>, flow: Flow, selectors: Selector[], privilegedSels: Set<string | null>, fallbackEntry: number | null): Flag[] {
   const out: Flag[] = []; const fn = (s: Selector): FlagFunction => ({ selector: s.selector, name: s.name });
   const hasOwner = selectors.some(s => s.selector === SEL_OWNER);
-  const facts = new Map(selectors.map(s => [s.selector, reachFacts(ops, byPc, dests, s.entry)]));
-  const nonstd = selectors.filter(s => !STD_SELS.has(s.selector));
-  const xr = new Set<number>(); for (const t of [SEL_TRANSFER, SEL_TRANSFER_FROM]) for (const r of facts.get(t)?.rd ?? []) xr.add(r);
+  const facts = new Map(selectors.map(s => [s.selector, reachFacts(ops, byPc, dests, flow, s.entry)]));
+  type F = ReturnType<typeof reachFacts>;
+  const guarded = (f: F): boolean => f.guard.size > 0 && f.names.has('CALLER') && hasCmp(f.names); // CALLER compared with a constant-slot SLOAD
+  const cands = selectors.filter(s => !CORE_SELS.has(s.selector));
+  const xr: Slots = new Set(); for (const t of [SEL_TRANSFER, SEL_TRANSFER_FROM]) for (const r of facts.get(t)?.rd ?? []) xr.add(r);
   if (hasOwner) {
-    const hits = nonstd.map(s => ({ s, f: facts.get(s.selector)!, slots: [...facts.get(s.selector)!.wr].filter(w => xr.has(w)) }))
-      .filter(h => h.f.names.has('CALLER') && h.f.names.has('SLOAD') && h.f.names.has('EQ') && h.f.wr.size > 0 && h.f.wr.size <= 3 && h.slots.length);
-    if (hits.length) out.push({ tag: 'owner_switch', severity: 'medium', detail: `slot ${[...new Set(hits.flatMap(h => h.slots))].sort((a, b) => a - b).join(', ')} written by a CALLER-guarded function and read by transfer`, functions: hits.map(h => fn(h.s)) });
+    const hits = cands.map(s => { const f = facts.get(s.selector)!; return { s, f, slots: [...f.wr].filter(w => xr.has(w) && !f.guard.has(w)) }; })
+      .filter(h => guarded(h.f) && h.slots.length);
+    if (hits.length) out.push({ tag: 'owner_switch', severity: 'medium', detail: `slot ${[...new Set(hits.flatMap(h => h.slots))].sort((a, b) => (a < b ? -1 : 1)).map(fmtSlot).join(', ')} written by a CALLER-guarded function and read by transfer`, functions: hits.map(h => fn(h.s)) });
   } else {
-    const hits = nonstd.filter(s => { const n = facts.get(s.selector)!.names; return ['CALLER', 'SLOAD', 'EQ', 'SSTORE'].every(x => n.has(x)) && !n.has('KECCAK256') && !privilegedSels.has(s.selector); });
-    if (hits.length) out.push({ tag: 'hidden_admin', severity: 'medium', detail: 'CALLER-guarded state write with no owner() getter', functions: hits.map(fn) });
+    const adm = (f: F): boolean => guarded(f) && f.names.has('SSTORE') && !f.names.has('KECCAK256');
+    const hits = cands.filter(s => adm(facts.get(s.selector)!) && !privilegedSels.has(s.selector)).map(fn);
+    if (fallbackEntry !== null && adm(reachFacts(ops, byPc, dests, flow, fallbackEntry)) && !privilegedSels.has(null)) hits.push({ selector: null, name: 'fallback/unknown' });
+    if (hits.length) out.push({ tag: 'hidden_admin', severity: 'medium', detail: 'CALLER-guarded state write with no owner() getter', functions: hits });
   }
   const liq = selectors.filter(s => SELF_LIQ_SELS.has(s.selector));
   if (liq.length) out.push({ tag: 'self_liquidity', severity: 'medium', detail: liq.map(s => s.name ?? s.selector).join(', '), functions: liq.map(fn) });
@@ -293,17 +361,25 @@ function behaviourFlags(ops: Op[], byPc: Map<number, number>, dests: Set<number>
 }
 
 // ---- flags ----
+/** Address constant from PUSH20, or a wider PUSH (immutable-style zero-padded word) whose value fits 160 bits and is >= 12 bytes; '0x'+40 hex, or null. */
+function addrConst(o: Op): string | null {
+  if (o.op < 0x73 || !o.data) return null;
+  const t = o.data.replace(/^0+/, '');
+  if (o.op === 0x73) return /^f+$/.test(o.data) ? null : '0x' + o.data;
+  return t.length < 24 || t.length > 40 || /^f+$/.test(t) ? null : '0x' + t.padStart(40, '0');
+}
 function detectFlags(ops: Op[], stripped: Buffer, strippedHash: string, live: Set<number>): { flag: Flag; sites: number[] }[] {
   const flags: { flag: Flag; sites: number[] }[] = [];
   const add = (tag: string, severity: 'high' | 'medium' | 'info', detail: string, sites: number[] = []): void => { flags.push({ flag: { tag, severity, detail, functions: [] }, sites }); };
   const names = new Set(ops.filter(o => live.has(o.pc)).map(o => o.name));
   const addrs = new Map<string, number[]>(); const privileged = new Map<string, number[]>();
   ops.forEach((o, i) => {
-    if (o.name !== 'PUSH20' || /^f+$/.test(o.data!) || !live.has(o.pc)) return; // data/string tails decode as fake PUSH20s; only reachable code counts
-    const a = '0x' + o.data!; addrs.set(a, [...(addrs.get(a) ?? []), o.pc]);
+    const a = live.has(o.pc) ? addrConst(o) : null; // data/string tails decode as fake PUSH20s; only reachable code counts
+    if (!a) return;
+    addrs.set(a, [...(addrs.get(a) ?? []), o.pc]);
     const w = ops.slice(Math.max(0, i - 6), i + 7);
-    // PUSH20 const vs CALLER/ORIGIN through EQ, either operand order, DUP/SWAP between
-    if (w.some(x => x.name === 'CALLER' || x.name === 'ORIGIN') && w.some(x => x.name === 'EQ')) privileged.set(a, [...(privileged.get(a) ?? []), o.pc, ...w.filter(x => x.name === 'CALLER' || x.name === 'ORIGIN').map(x => x.pc)]);
+    // address const vs CALLER/ORIGIN through EQ (or SUB/XOR + ISZERO), either operand order, DUP/SWAP between
+    if (w.some(x => x.name === 'CALLER' || x.name === 'ORIGIN') && hasCmp(new Set(w.map(x => x.name)))) privileged.set(a, [...(privileged.get(a) ?? []), o.pc, ...w.filter(x => x.name === 'CALLER' || x.name === 'ORIGIN').map(x => x.pc)]);
   });
   for (const [a, sites] of privileged) add('hardcoded_privileged_caller', 'high', a, sites);
   for (const [n, t] of [['SELFDESTRUCT', 'selfdestruct'], ['DELEGATECALL', 'delegatecall'], ['CALLCODE', 'callcode']] as const) if (names.has(n)) add(t, 'high', n, ops.filter(o => o.name === n && live.has(o.pc)).map(o => o.pc));
@@ -319,24 +395,27 @@ export function scanBytecode(hex: string): ScanResult {
   const code = Buffer.from(norm(hex), 'hex');
   const stripped = stripMetadata(code);
   const strippedCodeHash = keccak256(stripped);
-  const ops = disassemble(stripped);
+  // all detectors run on the FULL code: a fabricated metadata tail must not hide executable bytes. Stripping only feeds the hash (and the proxy-prefix match).
+  const ops = disassemble(code);
   const byPc = new Map(ops.map((o, i) => [o.pc, i]));
   const dests = new Set(ops.filter(o => o.name === 'JUMPDEST').map(o => o.pc));
+  const flow = simulate(ops);
   const selectors = extractSelectors(ops);
-  const walks = selectors.map(s => ({ ...s, ...listFunction(ops, byPc, dests, s.entry, stripped) }));
+  const walks = selectors.map(s => ({ ...s, ...listFunction(ops, byPc, dests, s.entry, code) }));
   const functions = walks.map(({ pcs: _p, ...f }) => f);
-  const flags = detectFlags(ops, stripped, strippedCodeHash, livePcs(ops, byPc, dests)).map(({ flag, sites }) => {
+  const fbEntry = selectors.length ? fallbackEntry(ops) : null;
+  const flags = detectFlags(ops, stripped, strippedCodeHash, livePcs(ops, byPc, dests, flow, stripped.length)).map(({ flag, sites }) => {
     flag.functions = walks.filter(w => sites.some(p => w.pcs.has(p))).map(w => ({ selector: w.selector, name: w.name }));
     return { flag, sites };
   });
-  if (selectors.length && flags.some(f => f.sites.length && !f.flag.functions.length)) {
-    const fb = fallthroughPcs(ops, byPc, dests, stripped);
-    for (const f of flags) if (f.sites.length && !f.flag.functions.length && f.sites.some(p => fb.has(p))) f.flag.functions = [{ selector: null, name: 'fallback/unknown' }];
+  if (fbEntry !== null && flags.some(f => f.sites.length)) {
+    const fb = listFunction(ops, byPc, dests, fbEntry, code).pcs;
+    for (const f of flags) if (f.sites.some(p => fb.has(p))) f.flag.functions.push({ selector: null, name: 'fallback/unknown' });
   }
-  // Uniswap v4 unlockCallback must check msg.sender == the canonical PoolManager: legitimate; any other constant stays flagged
+  // Uniswap v4 unlockCallback must check msg.sender == the canonical PoolManager: legitimate when it is the SOLE reacher; any other constant or reacher stays flagged
   const kept = flags.filter(f => !(f.flag.tag === 'hardcoded_privileged_caller' && POOL_MANAGERS.has(f.flag.detail) && f.flag.functions.length && f.flag.functions.every(x => x.selector === SEL_UNLOCK_CALLBACK)));
   const privileged = new Set(kept.filter(f => f.flag.tag === 'hardcoded_privileged_caller').flatMap(f => f.flag.functions.map(x => x.selector)));
-  const out = kept.map(f => f.flag).concat(behaviourFlags(ops, byPc, dests, selectors, privileged));
+  const out = kept.map(f => f.flag).concat(behaviourFlags(ops, byPc, dests, flow, selectors, privileged, fbEntry));
   if (selectors.length && !selectors.some(s => s.selector === '0x8da5cb5b')) out.push({ tag: 'no_owner_getter', severity: 'info', detail: 'no owner() selector', functions: [] });
   return { size: code.length, strippedSize: stripped.length, codeHash: keccak256(code), strippedCodeHash, selectors, functions, flags: out };
 }

@@ -29,10 +29,10 @@ bytecode --file code.hex
 
 | Option | Meaning |
 | --- | --- |
-| `--chain <name>` | `auto` (default; also used when no `--chain`/`--rpc`/`BYTECODE_RPC` is given): queries every built-in chain concurrently (8 s timeout each) and scans each chain that has code, reporting `chain` per result (JSON array when several). Failed chains are noted on stderr and in JSON `rpcErrors`; exit 2 if no chain has code or all errored. Or `ethereum`, `base`, `arbitrum`, `optimism`, `bsc`, `polygon`, `avalanche`, `robinhood`. These are public endpoints and may rate-limit; use `--rpc` for your own. |
+| `--chain <name>` | `auto` (default; also used when no `--chain`/`--rpc`/`BYTECODE_RPC` is given): queries every built-in chain concurrently (8 s timeout each) and scans each chain that has code, reporting `chain` per result (JSON array when several). Failed chains are noted on stderr and in JSON `rpcErrors` (these describe other chains and do not mark a result incomplete); exit 2 if no chain has code or all errored. Or `ethereum`, `base`, `arbitrum`, `optimism`, `bsc`, `polygon`, `avalanche`, `robinhood`. These are public endpoints and may rate-limit; use `--rpc` for your own. |
 | `--rpc <url>` | JSON-RPC endpoint. Default override: env `BYTECODE_RPC`. |
 | `--follow-proxy` | Detect an EIP-1167 minimal proxy (embedded address) or an EIP-1967 implementation/beacon slot or the legacy OpenZeppelin (zos) slot (`eth_getStorageAt`) and scan the implementation as well. |
-| `--json` | JSON output (an array when a proxy implementation or several chains are scanned). Each result has `chain`; each flag has `functions: [{selector, name}]` listing the dispatcher functions whose bounded walk reaches the flagged instruction (`{selector: null, name: "fallback/unknown"}` for the dispatcher fallthrough, empty for info flags). Text output prints `in: <function>` under each flag. |
+| `--json` | JSON output (a result carries `incomplete: [string]` only when coverage of that same contract failed: `--follow-proxy` could not read a proxy slot, call the beacon or fetch the implementation; consumers should not treat such a result as clean) (an array when a proxy implementation or several chains are scanned). Each result has `chain`; each flag has `functions: [{selector, name}]` listing the dispatcher functions whose bounded walk reaches the flagged instruction (`{selector: null, name: "fallback/unknown"}` for the dispatcher fallthrough, empty for info flags). Text output prints `in: <function>` under each flag. |
 | `--no-listing` | Skip annotated function listings. |
 | `--signatures <file>` | Load a JSON file `{"codeHashes": {"0x<keccak of stripped code>": "label"}, "addresses": {"0x<addr>": "label"}}` merged over the shipped (empty) tables. Default: env `BYTECODE_SIGNATURES`. Invalid file: exit 2. |
 | `--fail-on high` | Exit 1 if any high-severity flag is present. |
@@ -49,8 +49,8 @@ Exit codes: `0` analysed, `1` `--fail-on` tripped, `2` usage or fetch error.
 | `callcode` | high | Contains deprecated `CALLCODE`. |
 | `known_scam_codehash` | high | Metadata-stripped code hash matches an entry in the loaded signatures file. |
 | `known_scam_address` | high | A `PUSH20` constant matches an entry in the loaded signatures file. |
-| `owner_switch` | medium | Has `owner()`, and a non-standard function guarded by a `CALLER` check writes a constant storage slot that `transfer`/`transferFrom` read: the owner can flip a setting transfers depend on (sell lock, trading switch, limits, blacklist toggle). `functions` lists the setters; `detail` names the slot. |
-| `hidden_admin` | medium | No `owner()`, yet a non-standard function is guarded by `CALLER` == a stored constant-slot value and writes state. |
+| `owner_switch` | medium | Has `owner()`, and a function (other than the core ERC20 entry points) guarded by a `CALLER` check against a stored value writes a constant storage slot, other than the guard's own owner slot, that `transfer`/`transferFrom` read: the owner can flip a setting transfers depend on (sell lock, trading switch, limits, blacklist toggle). `functions` lists the setters; `detail` names the slot. |
+| `hidden_admin` | medium | No `owner()`, yet a function (or the dispatcher fallback) is guarded by `CALLER` == a stored constant-slot value and writes state. |
 | `self_liquidity` | medium | The token exposes `removeLiquidity`-style or Uniswap v4 `unlockCallback` selectors: it can manage or remove its own pool liquidity. |
 | `minimal_proxy` | info | EIP-1167 clone; logic lives at the embedded address. |
 | `eip1967_proxy` | info | Code references the EIP-1967 implementation/beacon slot. |
@@ -68,6 +68,8 @@ npm test    # builds, then runs node:test over synthetic bytecode; no network
 
 ## Limits
 
+- Pattern matching, not dataflow: a privileged address assembled at run time (loaded from code or memory, built with shifts/OR, or `CALLER` stashed in memory and compared far from the constant) is not recognised. Unresolvable jump targets are handled conservatively (all JUMPDESTs in the code region count as reachable), which can add false positives.
+- Known-hash matching is exact: appending or changing any byte defeats `known_scam_codehash`.
 - EVM only. Not zkSync Era / EraVM, and not non-EVM chains.
 - Static analysis cannot see storage-based backdoors (roles set at runtime with no getter).
 - This is disassembly with a bounded block walk, not decompilation; listings are hints and can be incomplete.

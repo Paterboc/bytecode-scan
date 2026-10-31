@@ -161,17 +161,61 @@ test('PUSH32-dispatched body is still reachable', () => {
   assert.ok(tags('0x' + pre + '5b73' + ADDR + '331400').includes('hardcoded_privileged_caller'));
 });
 
+// WHY: a security scanner must fail closed -- unresolved control flow and equivalent encodings must not hide a backdoor.
+const guardOf = (a) => '73' + a + '331450' + '00';
+test('computed jump target does not hide a backdoor', () => {
+  // PUSH1 4 PUSH1 4 ADD JUMP STOP STOP JUMPDEST <guard>: target 8 is computed, not pushed
+  assert.ok(tags('0x6004600401' + '56' + '0000' + '5b' + guardOf(ADDR).slice(0)).includes('hardcoded_privileged_caller'));
+});
+test('equivalent caller checks: wide immutable-style push, SUB/XOR + ISZERO', () => {
+  assert.ok(tags('0x74' + '00' + ADDR + '331450' + '00').includes('hardcoded_privileged_caller')); // PUSH21 0x00..addr
+  assert.ok(tags('0x7f' + '00'.repeat(12) + ADDR + '331450' + '00').includes('hardcoded_privileged_caller')); // PUSH32
+  assert.ok(tags('0x73' + ADDR + '33' + '03' + '15' + '00').includes('hardcoded_privileged_caller')); // CALLER SUB ISZERO
+  assert.ok(tags('0x73' + ADDR + '33' + '18' + '15' + '00').includes('hardcoded_privileged_caller')); // CALLER XOR ISZERO
+  assert.ok(!tags('0x7f' + '00'.repeat(31) + '01' + '331450' + '00').includes('hardcoded_privileged_caller')); // small number, not an address
+});
+test('fabricated metadata tail does not hide executable code', () => {
+  const body = '600556' + 'a1' + '00' + '5b' + guardOf(ADDR); // PUSH1 5 JUMP, 0xa1 (fake CBOR map), STOP, JUMPDEST, guard
+  const n = body.length / 2 + 2 - 5; // trailing length chosen so the stripped region is only the first 3 bytes
+  const hex = '0x' + body + n.toString(16).padStart(4, '0');
+  assert.equal(scanBytecode(hex).strippedSize, 3);
+  assert.ok(tags(hex).includes('hardcoded_privileged_caller'));
+});
+// WHY: unlockCallback is exempt only as the SOLE reacher; a shared fallback path keeps the flag.
+test('PoolManager guard shared with the fallback is still flagged', () => {
+  const hex = '0x' + '6391dd7346' + '14' + '610025' + '57' + '5b73' + POOL_MANAGER + '33145000' + '5b' + '61000a' + '56';
+  const f = find(hex, 'hardcoded_privileged_caller');
+  assert.deepEqual(f.functions.map(x => x.selector), ['0x91dd7346', null]);
+});
+// WHY: transfer locks in ordinary slots (0, 1, 64) must be seen; only the owner slot itself is not a "switch".
+test('owner_switch: any constant slot, but not the owner slot itself', () => {
+  const setter = (guard, w) => ['11223344', '33' + '60' + guard + '54' + '14' + '6001' + '60' + w + '55' + '00'];
+  for (const w of ['00', '01', '40']) {
+    const f = find(contract([OWNER, ['a9059cbb', readsSlot(w)], setter('09', w)]), 'owner_switch');
+    assert.ok(f, 'slot 0x' + w);
+    assert.match(f.detail, new RegExp('slot ' + parseInt(w, 16) + ' '));
+  }
+  assert.ok(!tags(contract([OWNER, ['a9059cbb', readsSlot('09')], setter('09', '09')])).includes('owner_switch')); // transferOwnership-like
+});
+test('hidden_admin: guard in the fallback', () => {
+  // dispatcher for transfer only; fallthrough: JUMPDEST CALLER == SLOAD(9) ; SSTORE slot 3
+  const hex = '0x' + '63a9059cbb' + '14' + '61001b' + '57' + '5b' + '33' + '600954' + '14' + '6001' + '6003' + '55' + '00' + '5b00';
+  const f = find(hex, 'hidden_admin');
+  assert.deepEqual(f.functions, [{ selector: null, name: 'fallback/unknown' }]);
+});
+
 // WHY: a junk proxy slot (nonzero, pointing at an empty account) must not lose the token's own high-severity result.
 test('--follow-proxy is best-effort: junk implementation slot keeps the main result', async () => {
   const { createServer } = await import('node:http');
   const { execFile } = await import('node:child_process');
+  let junk = true;
   const token = '0x' + 'd2'.repeat(20);
   const code = contract([['23b872dd', '73' + 'd2'.repeat(20) + '331450' + '00']]);
   const srv = createServer((req, res) => {
     let b = ''; req.on('data', d => b += d); req.on('end', () => {
       const j = JSON.parse(b); let result = '0x';
       if (j.method === 'eth_getCode') result = j.params[0] === token ? code : '0x';
-      if (j.method === 'eth_getStorageAt') result = '0x' + '00'.repeat(12) + 'ab'.repeat(20);
+      if (j.method === 'eth_getStorageAt') result = junk ? '0x' + '00'.repeat(12) + 'ab'.repeat(20) : '0x' + '00'.repeat(32);
       res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ jsonrpc: '2.0', id: j.id, result }));
     });
   });
@@ -182,7 +226,11 @@ test('--follow-proxy is best-effort: junk implementation slot keeps the main res
     const a = await run([]);
     assert.equal(a.code, 0);
     assert.match(a.err, /implementation unavailable/);
-    assert.ok(JSON.parse(a.out).flags.some(f => f.tag === 'hardcoded_privileged_caller'));
+    const j = JSON.parse(a.out);
+    assert.ok(j.flags.some(f => f.tag === 'hardcoded_privileged_caller'));
+    assert.ok(j.incomplete.some(m => /implementation unavailable/.test(m))); // hans fails closed on this field
+    junk = false;
+    assert.equal(JSON.parse((await run([])).out).incomplete, undefined); // clean run: field absent
     assert.equal((await run(['--fail-on', 'high'])).code, 1);
   } finally { srv.close(); }
 });
